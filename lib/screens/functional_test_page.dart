@@ -35,58 +35,59 @@ class _FunctionalTestPageState extends State<FunctionalTestPage>
   bool _started = false;
   bool _saved = false;
 
-  String _progress = 'Vorrichtung prüfen und Start bestätigen.';
+  String _progress = 'Bereit zur Funktionsprüfung.';
   String? _question;
 
   Completer<bool>? _visualAnswer;
-
   FunctionalTestResult? _result;
 
   @override
   void initState() {
     super.initState();
-
     WidgetsBinding.instance.addObserver(this);
 
     _runner = FunctionalTestRunner(
       io: widget.io,
       history: widget.history,
       session: widget.session,
-      approvedValues: Map<int, int>.from(widget.approvedValues),
+      approvedValues: widget.approvedValues,
       onProgress: (message) {
-        if (mounted) {
-          setState(() => _progress = message);
-        }
+        if (!mounted) return;
+
+        setState(() {
+          _progress = message;
+        });
       },
       askVisual: _askVisual,
     );
   }
 
   Future<bool> _askVisual(String question) {
-    final completer = Completer<bool>();
-    _visualAnswer = completer;
-
-    if (!mounted) {
-      completer.complete(false);
-      return completer.future;
+    if (!mounted || !_running) {
+      return Future<bool>.value(false);
     }
 
-    setState(() => _question = question);
+    final answer = Completer<bool>();
 
-    return completer.future;
+    setState(() {
+      _question = question;
+      _visualAnswer = answer;
+    });
+
+    return answer.future;
   }
 
-  void _answerVisual(bool accepted) {
+  void _answer(bool accepted) {
     final answer = _visualAnswer;
 
     if (answer == null || answer.isCompleted) return;
+
+    answer.complete(accepted);
 
     setState(() {
       _question = null;
       _visualAnswer = null;
     });
-
-    answer.complete(accepted);
   }
 
   void _abort() {
@@ -98,37 +99,32 @@ class _FunctionalTestPageState extends State<FunctionalTestPage>
       answer.complete(false);
     }
 
-    if (mounted) {
-      setState(() {
-        _question = null;
-        _visualAnswer = null;
-        _progress = 'Abbruch angefordert. Ausgänge werden gestoppt …';
-      });
-    }
-  }
-
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (_running && state != AppLifecycleState.resumed) {
-      _abort();
-    }
+    setState(() {
+      _question = null;
+      _visualAnswer = null;
+      _progress = 'Abbruch angefordert. Ausgänge werden gestoppt …';
+    });
   }
 
   Future<void> _start() async {
     if (_running || _started || !_fixtureReady) return;
 
     if (widget.history.operatorName.trim().isEmpty) {
-      setState(() {
-        _progress = 'Prüfername fehlt. Zur Parameterseite zurückgehen.';
-      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Bitte auf der Parameterseite den Prüfer eintragen.',
+          ),
+        ),
+      );
       return;
     }
 
     setState(() {
       _running = true;
       _started = true;
-      _result = null;
       _saved = false;
+      _result = null;
     });
 
     try {
@@ -144,7 +140,12 @@ class _FunctionalTestPageState extends State<FunctionalTestPage>
       if (!mounted) return;
 
       setState(() {
-        _progress = 'Prüfung konnte nicht abgeschlossen werden: $error';
+        _result = FunctionalTestResult(
+          status: 'FAIL',
+          message: error.toString(),
+          outputsVerifiedStopped: false,
+          csvSaved: false,
+        );
       });
     } finally {
       final answer = _visualAnswer;
@@ -163,7 +164,7 @@ class _FunctionalTestPageState extends State<FunctionalTestPage>
     }
   }
 
-  Future<void> _retrySave() async {
+  Future<void> _saveAgain() async {
     try {
       await widget.history.ensureSaved();
 
@@ -171,35 +172,36 @@ class _FunctionalTestPageState extends State<FunctionalTestPage>
 
       setState(() {
         _saved = true;
-        _progress = 'CSV erfolgreich gespeichert.';
       });
-    } catch (error) {
-      if (!mounted) return;
 
-      setState(() {
-        _saved = false;
-        _progress = 'Speichern weiterhin fehlgeschlagen: $error';
-      });
-    }
-  }
-
-  Future<void> _openHistory() async {
-    try {
-      await widget.history.ensureSaved();
-
-      if (!mounted) return;
-
-      await Navigator.of(context).push(
-        MaterialPageRoute(
-          builder: (_) => const TestHistoryPage(),
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('CSV erfolgreich gespeichert.'),
         ),
       );
     } catch (error) {
       if (!mounted) return;
 
-      setState(() {
-        _progress = 'CSV-Speicherung fehlgeschlagen: $error';
-      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Speichern fehlgeschlagen: $error'),
+        ),
+      );
+    }
+  }
+
+  Future<void> _openHistory() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => const TestHistoryPage(),
+      ),
+    );
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (_running && state != AppLifecycleState.resumed) {
+      _abort();
     }
   }
 
@@ -220,12 +222,64 @@ class _FunctionalTestPageState extends State<FunctionalTestPage>
     super.dispose();
   }
 
+  Widget _resultCard(FunctionalTestResult result) {
+    final passed =
+        result.status == 'FUNCTION_PASS_INSTALLATION_PENDING';
+
+    final color = passed ? Colors.green : Colors.red;
+
+    return Card(
+      color: color.withValues(alpha: 0.08),
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              passed
+                  ? 'FUNKTIONSPRÜFUNG: PASS'
+                  : result.status == 'ABORTED'
+                  ? 'ABGEBROCHEN'
+                  : 'FAIL',
+              style: TextStyle(
+                fontSize: 24,
+                fontWeight: FontWeight.bold,
+                color: color,
+              ),
+            ),
+            const SizedBox(height: 12),
+            Text(result.message),
+            const SizedBox(height: 16),
+            Text(
+              result.outputsVerifiedStopped
+                  ? 'Stillstand und PWM-Aus bestätigt.'
+                  : 'Stillstand/PWM-Aus nicht sicher bestätigt. '
+                  'Antrieb an der Vorrichtung prüfen.',
+            ),
+            const SizedBox(height: 8),
+            Text(
+              _saved
+                  ? 'Prüfergebnisse in Pruefungen.csv gespeichert.'
+                  : 'CSV noch nicht erfolgreich gespeichert.',
+            ),
+            if (passed) ...[
+              const SizedBox(height: 12),
+              const Text(
+                'Keine automatische Referenzfahrt durchgeführt. '
+                    'Der Positionsreset wurde gesendet. '
+                    'Eine vollständige Installationsfreigabe wird '
+                    'ohne Verifikation dieses Resets nicht erteilt.',
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final result = _result;
-
-    final functionPassed =
-        result?.status == 'FUNCTION_PASS_INSTALLATION_PENDING';
 
     return PopScope(
       canPop: !_running,
@@ -243,84 +297,115 @@ class _FunctionalTestPageState extends State<FunctionalTestPage>
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      widget.session.displayNumber,
+                      widget.session.testNumber ?? '',
                       style: const TextStyle(
                         fontSize: 22,
                         fontWeight: FontWeight.bold,
                       ),
                     ),
-                    const SizedBox(height: 10),
-                    Text('Gehäuse: ${widget.session.casingNumber}'),
+                    const SizedBox(height: 8),
                     Text(
-                      'Steuerung: ${widget.session.controllerSerial}',
+                      'Gehäuse: ${widget.session.casingNumber}',
                     ),
-                    Text('Prüfer: ${widget.history.operatorName}'),
+                    Text(
+                      'Steuerung: '
+                          '${widget.session.controllerSerial ?? '—'}',
+                    ),
+                    Text(
+                      'Prüfer: ${widget.history.operatorName}',
+                    ),
                   ],
                 ),
               ),
             ),
             const SizedBox(height: 16),
             const Text(
-              'Ablauf: UP 5 s → Stopp → DOWN 5 s → Stopp → '
-                  'Licht niedrig/hoch → visuelle Bestätigung → '
-                  'Licht hoch/niedrig → visuelle Bestätigung → Licht aus.',
+              'Prüfablauf',
+              style: TextStyle(
+                fontSize: 22,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+            const SizedBox(height: 10),
+            const Text(
+              '1. Parameter und Identität erneut prüfen.\n'
+                  '2. Aktiven Referenzmodus verlassen.\n'
+                  '3. UP 5 Sekunden, stoppen und Richtungspause.\n'
+                  '4. DOWN 5 Sekunden und stoppen.\n'
+                  '5. Licht niedrig → hoch: visuell bestätigen.\n'
+                  '6. Licht hoch → niedrig: visuell bestätigen.\n'
+                  '7. Licht aus: visuell bestätigen.\n'
+                  '8. Ausgänge abschalten und Stillstand prüfen.\n'
+                  '9. Nur bei PASS: Position für die spätere '
+                  'Kundeninstallation löschen.\n'
+                  '10. Ergebnisse in einer CSV-Datei speichern.',
             ),
             const SizedBox(height: 12),
             const Text(
-              'Die abschließende Installationsvorbereitung '
-                  'wird in dieser Version nicht durchgeführt.',
+              'Es wird keine automatische Fahrt zum '
+                  'mechanischen Endanschlag gestartet.',
             ),
-            const SizedBox(height: 16),
+            const SizedBox(height: 20),
             CheckboxListTile(
               contentPadding: EdgeInsets.zero,
+              title: const Text('Vorrichtung bereit'),
+              subtitle: const Text(
+                'Antrieb sicher befestigt. Bewegungsbereich frei. '
+                    'Ausreichend Verfahrweg für beide Richtungen. '
+                    'Unabhängige Abschaltmöglichkeit verfügbar.',
+              ),
               value: _fixtureReady,
               onChanged: _started
                   ? null
                   : (value) {
-                setState(() => _fixtureReady = value ?? false);
+                setState(() {
+                  _fixtureReady = value ?? false;
+                });
               },
-              title: const Text('Vorrichtung bereit'),
-              subtitle: const Text(
-                'Antrieb sicher befestigt, Bewegungsbereich frei '
-                    'und ausreichend Verfahrweg in beiden Richtungen.',
-              ),
             ),
             const SizedBox(height: 12),
             FilledButton.icon(
-              onPressed: !_started && _fixtureReady
+              onPressed:
+              _fixtureReady && !_running && !_started
                   ? _start
                   : null,
               icon: const Icon(Icons.play_arrow),
               label: const Text('Funktionsprüfung starten'),
             ),
             if (_running) ...[
-              const SizedBox(height: 12),
-              FilledButton.icon(
-                style: FilledButton.styleFrom(
-                  backgroundColor: Colors.red,
-                  foregroundColor: Colors.white,
+              const SizedBox(height: 16),
+              OutlinedButton.icon(
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: Colors.red,
                 ),
                 onPressed: _abort,
                 icon: const Icon(Icons.stop),
-                label: const Text('STOPP / ABBRECHEN'),
+                label: const Text('Prüfung abbrechen / stoppen'),
               ),
               const SizedBox(height: 16),
               const LinearProgressIndicator(),
             ],
-            const SizedBox(height: 16),
+            const SizedBox(height: 20),
             Text(
               _progress,
-              style: const TextStyle(fontWeight: FontWeight.w600),
+              style: const TextStyle(
+                fontWeight: FontWeight.bold,
+              ),
             ),
             if (_question != null) ...[
-              const SizedBox(height: 20),
+              const SizedBox(height: 16),
               Card(
-                color: Colors.orange.shade50,
                 child: Padding(
                   padding: const EdgeInsets.all(20),
                   child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    crossAxisAlignment:
+                    CrossAxisAlignment.stretch,
                     children: [
+                      const Icon(
+                        Icons.visibility,
+                        size: 36,
+                      ),
+                      const SizedBox(height: 12),
                       Text(
                         _question!,
                         style: const TextStyle(
@@ -330,13 +415,17 @@ class _FunctionalTestPageState extends State<FunctionalTestPage>
                       ),
                       const SizedBox(height: 16),
                       FilledButton(
-                        onPressed: () => _answerVisual(true),
-                        child: const Text('JA – akzeptiert'),
+                        onPressed: () => _answer(true),
+                        child: const Text(
+                          'Ja — visuell bestätigt',
+                        ),
                       ),
                       const SizedBox(height: 8),
                       OutlinedButton(
-                        onPressed: () => _answerVisual(false),
-                        child: const Text('NEIN – nicht akzeptiert'),
+                        onPressed: () => _answer(false),
+                        child: const Text(
+                          'Nein — nicht bestanden',
+                        ),
                       ),
                     ],
                   ),
@@ -345,67 +434,29 @@ class _FunctionalTestPageState extends State<FunctionalTestPage>
             ],
             if (result != null) ...[
               const SizedBox(height: 20),
-              Card(
-                child: Padding(
-                  padding: const EdgeInsets.all(20),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        !_saved
-                            ? 'SPEICHERFEHLER – KEINE FREIGABE'
-                            : functionPassed
-                            ? 'FUNKTIONSPRÜFUNG BESTANDEN'
-                            : result.status == 'ABORTED'
-                            ? 'ABGEBROCHEN'
-                            : 'FAIL',
-                        style: TextStyle(
-                          fontSize: 22,
-                          fontWeight: FontWeight.bold,
-                          color: functionPassed && _saved
-                              ? Colors.green
-                              : Colors.red,
-                        ),
-                      ),
-                      const SizedBox(height: 12),
-                      Text(result.message),
-                      const SizedBox(height: 12),
-                      Text(
-                        result.outputsVerifiedStopped
-                            ? 'Stillstand und PWM-Aus bestätigt.'
-                            : 'Endzustand NICHT bestätigt. '
-                            'Antrieb vor Ort prüfen.',
-                      ),
-                      const SizedBox(height: 8),
-                      Text(
-                        _saved
-                            ? 'CSV lokal gespeichert.'
-                            : 'CSV-Speicherung nicht bestätigt.',
-                      ),
-                      const SizedBox(height: 8),
-                      const Text(
-                        'Installationsvorbereitung ausstehend. '
-                            'Keine vollständige Installationsfreigabe.',
-                      ),
-                    ],
+              _resultCard(result),
+              if (!_saved) ...[
+                const SizedBox(height: 12),
+                OutlinedButton.icon(
+                  onPressed: _saveAgain,
+                  icon: const Icon(Icons.save),
+                  label: const Text(
+                    'CSV-Speicherung erneut versuchen',
                   ),
                 ),
-              ),
-              if (!_saved)
-                OutlinedButton.icon(
-                  onPressed: _retrySave,
-                  icon: const Icon(Icons.save),
-                  label: const Text('CSV erneut speichern'),
-                ),
+              ],
               const SizedBox(height: 12),
               OutlinedButton.icon(
                 onPressed: _openHistory,
-                icon: const Icon(Icons.history),
-                label: const Text('Prüfhistorie / CSV exportieren'),
+                icon: const Icon(Icons.download),
+                label: const Text(
+                  'Prüfhistorie / CSV exportieren',
+                ),
               ),
               const SizedBox(height: 12),
               FilledButton.icon(
-                onPressed: _saved && result.outputsVerifiedStopped
+                onPressed:
+                _saved && result.outputsVerifiedStopped
                     ? () {
                   Navigator.of(context).popUntil(
                         (route) => route.isFirst,

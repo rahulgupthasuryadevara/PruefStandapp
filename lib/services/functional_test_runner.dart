@@ -6,7 +6,6 @@ import 'test_history.dart';
 class FunctionalTestIo {
   final Future<int> Function(int register) read;
 
-  // The transport must check allowed immediately before writing.
   final Future<void> Function(
       String command,
       bool Function() allowed,
@@ -40,19 +39,21 @@ class FunctionalTestRunner {
   final TestHistory history;
   final TestSession session;
   final Map<int, int> approvedValues;
-
   final void Function(String message) onProgress;
   final Future<bool> Function(String question) askVisual;
 
-  bool _abortRequested = false;
-  bool _running = false;
-
   static const movementDuration = Duration(seconds: 5);
-  static const reversalPause = Duration(seconds: 1);
+  static const referenceTimeout = Duration(minutes: 3);
 
-  // Values are within the range used by your original app.
+  // Raw register values. Confirm scaling for your firmware.
+  static const testReferenceThreshold = 200;
+  static const finalReferenceThreshold = 7000;
+
   static const lowPwm = 75;
   static const highPwm = 750;
+
+  bool _abortRequested = false;
+  bool _running = false;
 
   FunctionalTestRunner({
     required this.io,
@@ -63,17 +64,14 @@ class FunctionalTestRunner {
     required this.askVisual,
   });
 
-  bool get isRunning => _running;
-
   void abort() {
     _abortRequested = true;
 
-    // Best-effort immediate stop. The run's finally block
-    // also stops outputs and verifies the stopped state.
-    io.write(
-      '#CMD idle 0\n',
-          () => true,
-    ).catchError((Object _) {});
+    unawaited(
+      io.write('#CMD idle 0\n', () => true).catchError(
+            (Object error) {},
+      ),
+    );
   }
 
   void _check() {
@@ -104,16 +102,16 @@ class FunctionalTestRunner {
     _check();
   }
 
-  Future<void> _record(
-      String stage,
-      String event, {
-        Object? register,
-        Object? expected,
-        Object? actual,
-        String unit = '',
-        String result = '',
-        String details = '',
-      }) {
+  Future<void> _record({
+    required String stage,
+    required String event,
+    Object? register,
+    Object? expected,
+    Object? actual,
+    String unit = '',
+    String result = '',
+    String details = '',
+  }) {
     return history.record(
       stage: stage,
       event: event,
@@ -131,14 +129,15 @@ class FunctionalTestRunner {
 
     while (clock.elapsed < duration) {
       _check();
+
       await Future<void>.delayed(
         const Duration(milliseconds: 100),
       );
     }
   }
 
-  Future<void> _verifyIdentityAndParameters() async {
-    onProgress('Identität und Parameter erneut prüfen …');
+  Future<void> _verifyParameters() async {
+    onProgress('Steuerungsnummer und Sollwerte prüfen …');
 
     final low = await _read(104);
     final high = await _read(105);
@@ -146,142 +145,357 @@ class FunctionalTestRunner {
 
     if (serial != session.controllerSerial) {
       throw StateError(
-        'Die verbundene Steuerung stimmt nicht '
-            'mit der gespeicherten Zuordnung überein.',
+        'Steuerungsseriennummer stimmt nicht überein. '
+            'Zugeordnet=${session.controllerSerial}; '
+            'gelesen=$serial.',
       );
     }
 
     await _record(
-      'Vorprüfung',
-      'Steuerungsidentität bestätigt',
+      stage: 'Vorprüfung',
+      event: 'Steuerungsseriennummer bestätigt',
+      expected: session.controllerSerial,
       actual: serial,
       result: 'OK',
     );
 
     for (final entry in approvedValues.entries) {
-      final value = await _read(entry.key);
-      final matches = value == entry.value;
+      final actual = await _read(entry.key);
+      final passed = actual == entry.value;
 
       await _record(
-        'Vorprüfung',
-        'Sollwert erneut geprüft',
+        stage: 'Vorprüfung',
+        event: 'Sollwert erneut geprüft',
         register: entry.key,
         expected: entry.value,
-        actual: value,
-        result: matches ? 'OK' : 'FAIL',
+        actual: actual,
+        result: passed ? 'OK' : 'FAIL',
       );
 
-      if (!matches) {
+      if (!passed) {
         throw StateError(
-          'Parameterabweichung bei Register ${entry.key}.',
+          'Register ${entry.key}: '
+              'Soll=${entry.value}; Ist=$actual.',
         );
       }
     }
 
     final error = await _read(12002);
 
+    await _record(
+      stage: 'Vorprüfung',
+      event: 'Fehlerstatus geprüft',
+      register: 12002,
+      expected: 0,
+      actual: error,
+      result: error == 0 ? 'OK' : 'FAIL',
+    );
+
     if (error != 0) {
-      throw StateError('Steuerungsfehler: $error');
-    }
-  }
-
-  Future<void> _prepareNormalMode() async {
-    onProgress('Betriebsart für Bewegungsprüfung vorbereiten …');
-
-    await _write('#CMD idle 0\n');
-    await _write('#R4002=0\n');
-
-    final referenceState = await _read(12010);
-    final mode = await _read(12000);
-
-    await _record(
-      'Betriebsart',
-      'Ausgangszustand',
-      register: 12010,
-      actual: referenceState,
-      details: 'Kanalbetriebsart 12000=$mode',
-    );
-
-    if (referenceState == 1 || mode != 6) {
-      // Sequence taken from the original app's
-      // _exitReferenceAndEnableMovement implementation.
-      const commands = [
-        '#CMD idle 0\n',
-        '#R3502=0\n',
-        '#R4002=0\n',
-        '#R4000=6\n',
-        '#R4000=0\n',
-        '#R4000=0\n',
-        '#R4000=6\n',
-        '#R4000=6\n',
-        '#CMD idle 0\n',
-      ];
-
-      for (final command in commands) {
-        await _write(command);
-        await _pause(const Duration(milliseconds: 250));
-      }
-    }
-
-    final checkedMode = await _read(12000);
-    final checkedReference = await _read(12010);
-    final moving = await _read(12503);
-    final error = await _read(12002);
-
-    await _record(
-      'Betriebsart',
-      'Bewegungsbereitschaft geprüft',
-      actual: checkedMode,
-      expected: 6,
-      result: checkedMode == 6 &&
-          checkedReference != 1 &&
-          moving == 0 &&
-          error == 0
-          ? 'OK'
-          : 'FAIL',
-      details: '12010=$checkedReference; '
-          '12503=$moving; 12002=$error',
-    );
-
-    if (checkedMode != 6 ||
-        checkedReference == 1 ||
-        moving != 0 ||
-        error != 0) {
-      throw StateError(
-        'Steuerung nicht für normale Bewegung bereit. '
-            'Referenz/Installation muss separat geprüft werden.',
-      );
+      throw StateError('Fehlerstatus=$error.');
     }
   }
 
   Future<void> _stopMotor() async {
-    await io.write('#CMD idle 0\n', () => true);
-    await io.write('#R4002=0\n', () => true);
+    Object? firstError;
+
+    for (final command in [
+      '#CMD idle 0\n',
+      '#R3502=0\n',
+      '#R4002=0\n',
+    ]) {
+      try {
+        await io.write(command, () => true);
+      } catch (error) {
+        firstError ??= error;
+      }
+    }
+
+    if (firstError != null) {
+      throw StateError(
+        'Motor-Stopp nicht vollständig übertragen: $firstError',
+      );
+    }
   }
 
   Future<void> _waitUntilStopped() async {
     final clock = Stopwatch()..start();
 
-    while (clock.elapsed < const Duration(seconds: 4)) {
-      if (await io.read(12503) == 0) return;
+    while (clock.elapsed < const Duration(seconds: 8)) {
+      final moving = await io.read(12503);
+
+      if (moving == 0) return;
 
       await Future<void>.delayed(
         const Duration(milliseconds: 150),
       );
     }
 
-    throw StateError(
-      'Stillstand wurde nicht rechtzeitig bestätigt.',
+    throw TimeoutException(
+      'Stillstand nicht bestätigt: Register 12503 ist nicht 0.',
     );
   }
 
-  Future<void> _move({
-    required bool up,
-  }) async {
-    final name = up ? 'UP' : 'DOWN';
-    final command = up ? '#CMD up 0\n' : '#CMD down 0\n';
+  Future<void> _prepareNormalMode() async {
+    onProgress('Referenzstatus und Betriebszustand lesen …');
 
-    onProgress('$name: Bewegung für 5 Sekunden …');
+    final reference = await _read(12010);
+    final mode = await _read(12000);
+    final state = await _read(12001);
+    final moving = await _read(12503);
+
+    await _record(
+      stage: 'Referenz',
+      event: 'Referenzstatus vor Prüfung',
+      register: 12010,
+      actual: reference,
+      result: 'INFO',
+      details:
+      'Modus=$mode; Zustand=$state; Bewegung=$moving',
+    );
+
+    onProgress('Referenzmodus verlassen …');
+
+    // Exit sequence from the supplied original app.
+    const commands = [
+      '#CMD idle 0\n',
+      '#R3502=0\n',
+      '#R4002=0\n',
+      '#R4000=6\n',
+      '#R4000=0\n',
+      '#R4000=0\n',
+      '#R4000=6\n',
+      '#R4000=6\n',
+      '#CMD idle 0\n',
+    ];
+
+    for (final command in commands) {
+      await _write(command);
+      await _pause(const Duration(milliseconds: 250));
+    }
+
+    await _pause(const Duration(milliseconds: 500));
+
+    final clock = Stopwatch()..start();
+    var lastReadings = '';
+
+    while (clock.elapsed < const Duration(seconds: 12)) {
+      final currentMode = await _read(12000);
+      final currentState = await _read(12001);
+      final currentMoving = await _read(12503);
+      final currentReference = await _read(12010);
+      final error = await _read(12002);
+
+      lastReadings =
+      '12000=$currentMode; '
+          '12001=$currentState; '
+          '12503=$currentMoving; '
+          '12010=$currentReference; '
+          '12002=$error';
+
+      onProgress('Normalbetrieb prüfen: $lastReadings');
+
+      if (error != 0) {
+        throw StateError(
+          'Fehler nach Referenzmodus-Ausgang: $lastReadings',
+        );
+      }
+
+      if (currentMode == 6 &&
+          currentState == 0 &&
+          currentMoving == 0) {
+        await _record(
+          stage: 'Referenz',
+          event: 'Normalbetrieb bestätigt',
+          expected: '12000=6; 12001=0; 12503=0; 12002=0',
+          actual: lastReadings,
+          result: 'PASS',
+        );
+
+        return;
+      }
+
+      await _pause(const Duration(milliseconds: 250));
+    }
+
+    throw StateError(
+      'Normalbetrieb nicht bestätigt. $lastReadings',
+    );
+  }
+
+  Future<void> _setReferenceThreshold(int value) async {
+    onProgress('Referenz-Stromschwelle auf $value einstellen …');
+
+    await _write('#R29000=$value\n');
+    await _pause(const Duration(milliseconds: 250));
+
+    final actual = await _read(29000);
+
+    await _record(
+      stage: 'Referenz',
+      event: 'Referenz-Stromschwelle eingestellt',
+      register: 29000,
+      expected: value,
+      actual: actual,
+      unit: 'Registerwert',
+      result: actual == value ? 'PASS' : 'FAIL',
+    );
+
+    if (actual != value) {
+      throw StateError(
+        'Referenz-Stromschwelle nicht übernommen: '
+            'Soll=$value; Ist=$actual.',
+      );
+    }
+  }
+
+  Future<void> _performInitialReferenceRun() async {
+    var passed = false;
+    String failureDetails = '';
+
+    try {
+      await _record(
+        stage: 'Referenz',
+        event: 'Referenzfahrt angefordert',
+        register: 4004,
+        expected: 0,
+        result: 'REQUESTED',
+        details:
+        'Temporäre Stromschwelle=$testReferenceThreshold.',
+      );
+
+      onProgress('Referenzfahrt starten …');
+
+      await _write('#R4004=0\n');
+
+      final clock = Stopwatch()..start();
+      var activeSeen = false;
+      int? lastState;
+
+      while (clock.elapsed < referenceTimeout) {
+        final state = await _read(12010);
+        final error = await _read(12002);
+
+        if (state != lastState) {
+          await _record(
+            stage: 'Referenz',
+            event: 'Referenzstatus geändert',
+            register: 12010,
+            actual: state,
+            result: 'INFO',
+          );
+
+          lastState = state;
+        }
+
+        onProgress(
+          'Referenzfahrt: Status=$state; '
+              'Fehler=$error; ${clock.elapsed.inSeconds} s',
+        );
+
+        if (error != 0) {
+          throw StateError(
+            'Referenzfahrt: Fehlerstatus=$error.',
+          );
+        }
+
+        if (state == 1) {
+          activeSeen = true;
+        }
+
+        if (activeSeen && state == 2) {
+          final position = await _read(11503);
+
+          await _record(
+            stage: 'Referenz',
+            event: 'Referenz gefunden',
+            register: 11503,
+            actual: position,
+            unit: 'mm',
+            result: 'PASS',
+            details:
+            'Status 1 und anschließend 2 beobachtet; '
+                'Dauer_ms=${clock.elapsedMilliseconds}.',
+          );
+
+          passed = true;
+          return;
+        }
+
+        await _pause(const Duration(milliseconds: 200));
+      }
+
+      throw TimeoutException(
+        'Referenzfahrt nach 3 Minuten nicht bestätigt. '
+            'Letzter Status=$lastState; '
+            'Aktiver Status beobachtet=$activeSeen.',
+      );
+    } catch (error) {
+      failureDetails = error.toString();
+      rethrow;
+    } finally {
+      if (!passed) {
+        // Stop first. Persistence errors must not prevent stopping.
+        try {
+          await _stopMotor();
+        } catch (_) {}
+
+        try {
+          await _record(
+            stage: 'Referenz',
+            event: 'Referenzfahrt fehlgeschlagen',
+            result: _abortRequested ? 'ABORTED' : 'FAIL',
+            details: failureDetails,
+          );
+        } catch (_) {}
+      }
+    }
+  }
+
+  Future<void> _restoreReferenceThreshold() async {
+    // Restoration must remain possible after an operator abort.
+    if (!io.isConnected()) {
+      throw StateError(
+        'Keine Verbindung zur Wiederherstellung der Stromschwelle.',
+      );
+    }
+
+    onProgress('Referenz-Stromschwelle auf 7000 zurücksetzen …');
+
+    await io.write(
+      '#R29000=$finalReferenceThreshold\n',
+          () => io.isConnected(),
+    );
+
+    await Future<void>.delayed(
+      const Duration(milliseconds: 250),
+    );
+
+    final actual = await io.read(29000);
+
+    await _record(
+      stage: 'Referenz',
+      event: 'Referenz-Stromschwelle wiederhergestellt',
+      register: 29000,
+      expected: finalReferenceThreshold,
+      actual: actual,
+      unit: 'Registerwert',
+      result: actual == finalReferenceThreshold ? 'PASS' : 'FAIL',
+    );
+
+    if (actual != finalReferenceThreshold) {
+      throw StateError(
+        'Wiederherstellung fehlgeschlagen: '
+            'Soll=$finalReferenceThreshold; Ist=$actual.',
+      );
+    }
+  }
+
+  Future<void> _move({required bool up}) async {
+    _check();
+
+    final direction = up ? 'UP' : 'DOWN';
+    final command = up ? '#CMD up 0\n' : '#CMD down 0\n';
 
     final start = await _read(11503);
     final lower = await _read(20024);
@@ -289,62 +503,64 @@ class FunctionalTestRunner {
 
     if (lower >= upper ||
         start < lower ||
-        start > upper) {
+        start > upper ||
+        (up && start >= upper) ||
+        (!up && start <= lower)) {
       throw StateError(
-        'Position oder Verfahrgrenzen sind ungültig.',
-      );
-    }
-
-    if ((up && start >= upper - 1) ||
-        (!up && start <= lower + 1)) {
-      throw StateError(
-        '$name-Test nicht möglich: '
-            'Zu wenig Weg bis zur Verfahrgrenze.',
+        '$direction: Startposition oder Verfahrgrenzen ungültig. '
+            'Position=$start; Untergrenze=$lower; Obergrenze=$upper.',
       );
     }
 
     await _record(
-      'Bewegung $name',
-      'Start',
+      stage: 'Bewegung $direction',
+      event: 'Start',
       register: 11503,
       actual: start,
       unit: 'mm',
-      details: 'Sollzeit=5000 ms; '
-          'Untergrenze=$lower; Obergrenze=$upper',
+      result: 'STARTED',
+      details: 'Sollzeit=5000 ms.',
     );
 
-    _check();
+    onProgress('$direction: Bewegung für 5 Sekunden …');
+
+    var active = true;
+    var movementDetected = false;
+    var previousPosition = start;
+    Object? movementError;
 
     final samples = <Map<String, int>>[];
     final clock = Stopwatch()..start();
-    var active = true;
-    var sawMovement = false;
+    final deadline = Completer<void>();
 
-    final deadlineStop = Completer<void>();
+    final observedDeadline = deadline.future.then<void>(
+          (_) {},
+      onError: (Object error, StackTrace stackTrace) {
+        movementError ??= error;
+      },
+    );
 
-    // Observe this future immediately, including errors.
-    final observedDeadline = deadlineStop.future;
-    observedDeadline.catchError((Object _) {});
-
-    final deadlineTimer = Timer(movementDuration, () {
+    final timer = Timer(movementDuration, () {
       active = false;
 
-      _stopMotor().then(
-            (_) {
-          if (!deadlineStop.isCompleted) {
-            deadlineStop.complete();
-          }
-        },
-        onError: (Object error, StackTrace stackTrace) {
-          if (!deadlineStop.isCompleted) {
-            deadlineStop.completeError(error, stackTrace);
-          }
-        },
+      unawaited(
+        _stopMotor().then<void>(
+              (_) {
+            if (!deadline.isCompleted) deadline.complete();
+          },
+          onError: (Object error, StackTrace stackTrace) {
+            if (!deadline.isCompleted) {
+              deadline.completeError(error, stackTrace);
+            }
+          },
+        ),
       );
     });
 
-    Future<void> repeatMovementCommand() async {
-      while (active && !_abortRequested) {
+    Future<void> repeatMovement() async {
+      while (active && clock.elapsed < movementDuration) {
+        _check();
+
         await io.write(
           command,
               () =>
@@ -354,246 +570,257 @@ class FunctionalTestRunner {
               clock.elapsed < movementDuration,
         );
 
-        if (!active || _abortRequested) break;
-
         await Future<void>.delayed(
           const Duration(milliseconds: 800),
         );
       }
     }
 
-    Future<void> monitor() async {
-      while (active && !_abortRequested) {
-        _check();
-
+    Future<void> monitorMovement() async {
+      while (active) {
         final position = await _read(11503);
-
-        if (!active) break;
-
-        final error = await _read(12002);
-
-        if (!active) break;
+        if (!active) return;
 
         final moving = await _read(12503);
+        if (!active) return;
 
-        if (!active) break;
+        final error = await _read(12002);
+        if (!active) return;
 
         samples.add({
-          'elapsed_ms': clock.elapsedMilliseconds,
+          'elapsed': clock.elapsedMilliseconds,
           'position': position,
-          'error': error,
           'moving': moving,
+          'error': error,
         });
 
-        if (moving == 1) sawMovement = true;
+        if (moving == 1) movementDetected = true;
 
         if (error != 0) {
-          throw StateError(
-            'Steuerungsfehler während $name: $error',
-          );
+          throw StateError('$direction: Fehlerstatus=$error.');
         }
 
         if (position < lower || position > upper) {
           throw StateError(
-            'Position außerhalb der Verfahrgrenzen.',
+            '$direction: Position außerhalb der Grenzen.',
           );
         }
 
-        if ((up && position < start - 1) ||
-            (!up && position > start + 1)) {
+        if ((up && position < previousPosition - 1) ||
+            (!up && position > previousPosition + 1)) {
           throw StateError(
-            'Unerwartete Bewegungsrichtung bei $name.',
+            '$direction: Falsche Bewegungsrichtung.',
           );
         }
 
         if ((up && position >= upper) ||
             (!up && position <= lower)) {
           throw StateError(
-            'Verfahrgrenze während $name erreicht.',
+            '$direction: Verfahrgrenze vorzeitig erreicht.',
           );
         }
 
-        if (clock.elapsedMilliseconds > 1500 && moving == 0) {
-          throw StateError(
-            '$name wurde vor Ablauf der Prüfzeit gestoppt.',
-          );
-        }
+        previousPosition = position;
 
-        await Future<void>.delayed(
-          const Duration(milliseconds: 100),
-        );
+        await _pause(const Duration(milliseconds: 100));
       }
-
-      _check();
     }
 
-    final repeatFuture = repeatMovementCommand();
-    final monitorFuture = monitor();
+    final repeat = repeatMovement();
+    final monitor = monitorMovement();
 
     try {
       await Future.wait<void>(
-        [repeatFuture, monitorFuture],
+        [repeat, monitor],
         eagerError: true,
       );
 
       await observedDeadline;
+
+      if (movementError != null) {
+        throw StateError(movementError.toString());
+      }
+
       _check();
+    } catch (error) {
+      movementError ??= error;
     } finally {
       active = false;
-      deadlineTimer.cancel();
+      timer.cancel();
 
-      // Stop before waiting for any remaining read to finish.
       try {
         await _stopMotor();
-      } finally {
-        // Drain both tasks so they cannot overlap the next step.
-        await Future.wait<void>(
-          [repeatFuture, monitorFuture],
-        ).catchError((Object _) {});
+      } catch (error) {
+        movementError ??= error;
       }
 
-      if (!deadlineStop.isCompleted) {
-        deadlineStop.complete();
-      }
+      await Future.wait<void>([
+        repeat.catchError((Object error) {}),
+        monitor.catchError((Object error) {}),
+      ]);
 
-      for (final sample in samples) {
-        await _record(
-          'Bewegung $name',
-          'Messwert',
-          register: 11503,
-          actual: sample['position'],
-          unit: 'mm',
-          details: 'elapsed_ms=${sample['elapsed_ms']}; '
-              '12002=${sample['error']}; '
-              '12503=${sample['moving']}',
-        );
-      }
+      if (!deadline.isCompleted) deadline.complete();
+      await observedDeadline;
     }
 
     await _waitUntilStopped();
 
-    final end = await _read(11503);
-    final error = await _read(12002);
-    final delta = end - start;
-
-    final directionCorrect = up ? delta > 0 : delta < 0;
+    final end = await io.read(11503);
+    final finalError = await io.read(12002);
+    final difference = end - start;
 
     final passed =
-        sawMovement && directionCorrect && error == 0;
+        movementError == null &&
+            !_abortRequested &&
+            movementDetected &&
+            finalError == 0 &&
+            (up ? difference > 0 : difference < 0);
+
+    for (final sample in samples) {
+      await _record(
+        stage: 'Bewegung $direction',
+        event: 'Messwert',
+        register: 11503,
+        actual: sample['position'],
+        unit: 'mm',
+        result: 'INFO',
+        details:
+        'Zeit_ms=${sample['elapsed']}; '
+            'Bewegung=${sample['moving']}; '
+            'Fehler=${sample['error']}',
+      );
+    }
 
     await _record(
-      'Bewegung $name',
-      'Ergebnis',
+      stage: 'Bewegung $direction',
+      event: 'Ergebnis',
       register: 11503,
       expected: up ? 'Position steigt' : 'Position sinkt',
       actual: end,
       unit: 'mm',
       result: passed ? 'OK' : 'FAIL',
-      details: 'Start=$start; Ende=$end; Differenz=$delta; '
+      details:
+      'Start=$start; Ende=$end; Differenz=$difference; '
           'Sollzeit=5000 ms; '
           'Zeit_bis_Stillstandsprüfung_ms=${clock.elapsedMilliseconds}; '
-          'Bewegung_erkannt=$sawMovement; Fehler=$error',
+          'Bewegung_erkannt=$movementDetected; Fehler=$finalError'
+          '${movementError == null ? '' : '; Ursache=$movementError'}',
     );
 
+    _check();
+
     if (!passed) {
-      throw StateError('$name-Bewegungsprüfung fehlgeschlagen.');
+      throw StateError(
+        '$direction-Prüfung fehlgeschlagen. '
+            '${movementError ?? 'Bewegung nicht bestätigt.'}',
+      );
     }
   }
 
   Future<void> _ramp({
     required int from,
     required int to,
-    required String name,
+    required String event,
   }) async {
-    onProgress(name);
-
-    const steps = 10;
-
-    for (var step = 0; step <= steps; step++) {
-      final target =
-      (from + (to - from) * step / steps).round();
+    for (var step = 0; step <= 10; step++) {
+      final target = (from + (to - from) * step / 10).round();
 
       await _write('#R31087=$target\n');
 
       final actual = await _read(31087);
       final error = await _read(12002);
+      final passed = actual == target && error == 0;
 
       await _record(
-        'Beleuchtung',
-        name,
+        stage: 'Beleuchtung',
+        event: event,
         register: 31087,
         expected: target,
         actual: actual,
-        result: actual == target && error == 0
-            ? 'REGISTER_OK'
-            : 'FAIL',
-        details: 'Nur Registerprüfung; '
-            'visuelle Bestätigung erfolgt separat.',
+        result: passed ? 'REGISTER_OK' : 'FAIL',
+        details: 'Fehlerstatus=$error',
       );
 
-      if (actual != target || error != 0) {
+      if (!passed) {
         throw StateError(
-          'PWM-Rückmeldung oder Fehlerstatus nicht korrekt.',
+          'PWM-Prüfung: Soll=$target; Ist=$actual; Fehler=$error.',
         );
       }
 
-      if (step < steps) {
-        await _pause(const Duration(milliseconds: 500));
-      }
+      await _pause(const Duration(milliseconds: 500));
     }
+
+    await _record(
+      stage: 'Beleuchtung',
+      event: '$event abgeschlossen',
+      result: 'PASS',
+    );
   }
 
-  Future<bool> _visualQuestion(String question) async {
-    onProgress('Visuelle Bestätigung durch Prüfer erforderlich.');
+  Future<void> _visual({
+    required String event,
+    required String question,
+  }) async {
+    _check();
+    onProgress(question);
 
-    var answered = false;
-    var answer = false;
+    var completed = false;
+    var accepted = false;
+    Object? answerError;
 
-    final answerFuture = askVisual(question).then((value) {
-      answer = value;
-      answered = true;
-    });
+    final answer = Future<bool>.sync(
+          () => askVisual(question),
+    ).then<void>(
+          (value) {
+        accepted = value;
+        completed = true;
+      },
+      onError: (Object error, StackTrace stackTrace) {
+        answerError = error;
+        completed = true;
+      },
+    );
 
     final clock = Stopwatch()..start();
 
-    try {
-      while (!answered) {
-        _check();
+    while (!completed) {
+      _check();
 
-        if (clock.elapsed > const Duration(minutes: 2)) {
-          throw StateError(
-            'Zeitüberschreitung bei visueller Bestätigung.',
-          );
-        }
-
-        // Keep communication active while waiting for the operator.
-        final error = await _read(12002);
-
-        if (error != 0) {
-          throw StateError('Steuerungsfehler: $error');
-        }
-
-        await _pause(const Duration(milliseconds: 500));
+      if (clock.elapsed > const Duration(minutes: 2)) {
+        throw TimeoutException(
+          'Keine visuelle Bestätigung innerhalb von 2 Minuten.',
+        );
       }
 
-      await answerFuture;
+      final error = await _read(12002);
 
-      await _record(
-        'Beleuchtung',
-        question,
-        actual: answer ? 'JA' : 'NEIN',
-        result: answer ? 'VISUAL_OK' : 'VISUAL_FAIL',
-        details: 'Prüfer: ${history.operatorName}',
-      );
+      if (error != 0) {
+        throw StateError('Fehler während Sichtprüfung: $error.');
+      }
 
-      return answer;
-    } finally {
-      // The page clears any outstanding question when the run ends.
+      await _pause(const Duration(milliseconds: 500));
+    }
+
+    await answer;
+    _check();
+
+    await _record(
+      stage: 'Beleuchtung',
+      event: event,
+      expected: 'JA',
+      actual: accepted ? 'JA' : 'NEIN',
+      result:
+      accepted && answerError == null ? 'VISUAL_OK' : 'FAIL',
+      details: answerError?.toString() ?? '',
+    );
+
+    if (!accepted || answerError != null) {
+      throw StateError('Sichtprüfung nicht bestanden: $event.');
     }
   }
 
   Future<void> _lighting() async {
-    onProgress('Beleuchtung einschalten …');
+    onProgress('Beleuchtung: niedrig → hoch …');
 
     await _write('#R31087=$lowPwm\n');
     await _write('#R2702=1\n');
@@ -601,48 +828,42 @@ class FunctionalTestRunner {
     await _ramp(
       from: lowPwm,
       to: highPwm,
-      name: 'Helligkeit niedrig → hoch',
+      event: 'PWM niedrig nach hoch',
     );
 
-    if (!await _visualQuestion(
-      'Ist die Helligkeit sichtbar angestiegen?',
-    )) {
-      throw StateError(
-        'Helligkeitsanstieg visuell nicht akzeptiert.',
-      );
-    }
+    await _visual(
+      event: 'Helligkeit angestiegen',
+      question: 'Ist die Helligkeit sichtbar angestiegen?',
+    );
+
+    onProgress('Beleuchtung: hoch → niedrig …');
 
     await _ramp(
       from: highPwm,
       to: lowPwm,
-      name: 'Helligkeit hoch → niedrig',
+      event: 'PWM hoch nach niedrig',
     );
 
-    if (!await _visualQuestion(
-      'Ist die Helligkeit sichtbar abgesunken?',
-    )) {
-      throw StateError(
-        'Helligkeitsabsenkung visuell nicht akzeptiert.',
-      );
-    }
+    await _visual(
+      event: 'Helligkeit abgesunken',
+      question: 'Ist die Helligkeit sichtbar abgesunken?',
+    );
 
     await _write('#R31087=0\n');
     await _write('#R2702=2\n');
 
-    if (!await _visualQuestion(
-      'Ist die Beleuchtung ausgeschaltet?',
-    )) {
-      throw StateError(
-        'Ausschalten der Beleuchtung visuell nicht bestätigt.',
-      );
-    }
+    await _visual(
+      event: 'Beleuchtung ausgeschaltet',
+      question: 'Ist die Beleuchtung ausgeschaltet?',
+    );
   }
 
   Future<void> _stopAllOutputs() async {
-    final errors = <String>[];
+    Object? firstError;
 
     for (final command in [
       '#CMD idle 0\n',
+      '#R3502=0\n',
       '#R4002=0\n',
       '#R31087=0\n',
       '#R2702=2\n',
@@ -650,14 +871,99 @@ class FunctionalTestRunner {
       try {
         await io.write(command, () => true);
       } catch (error) {
-        errors.add(error.toString());
+        firstError ??= error;
       }
     }
 
-    if (errors.isNotEmpty) {
+    if (firstError != null) {
       throw StateError(
-        'Ausgänge konnten nicht vollständig gestoppt werden: '
-            '${errors.join("; ")}',
+        'Abschaltbefehle nicht vollständig übertragen: $firstError',
+      );
+    }
+  }
+
+  Future<void> _saveFinalConfiguration() async {
+    final threshold = await _read(29000);
+
+    if (threshold != finalReferenceThreshold) {
+      throw StateError(
+        'Speichern gesperrt: Referenz-Stromschwelle=$threshold.',
+      );
+    }
+
+    onProgress('Abschließende Konfiguration speichern …');
+
+    await _write('#R3002=0\n');
+    await _pause(const Duration(milliseconds: 500));
+
+    final readback = await _read(29000);
+
+    await _record(
+      stage: 'Installation',
+      event: 'Konfiguration speichern angefordert',
+      register: 3002,
+      actual: 0,
+      result: 'COMMAND_SENT',
+      details:
+      'Register 29000 nach Speicherbefehl=$readback. '
+          'Flash-Persistenz nicht durch Neustart verifiziert.',
+    );
+
+    if (readback != finalReferenceThreshold) {
+      throw StateError(
+        'Stromschwelle nach Speicherbefehl unerwartet: $readback.',
+      );
+    }
+  }
+
+  Future<void> _prepareCustomerInstallation() async {
+    onProgress('Position für Kundeninstallation löschen …');
+
+    await _record(
+      stage: 'Installation',
+      event: 'Positionsreset angefordert',
+      register: 4009,
+      expected: 0,
+      result: 'REQUESTED',
+    );
+
+    // Require reference during customer installation.
+    // Do not start another physical reference movement.
+    await _write('#R4009=0\n');
+
+    await _record(
+      stage: 'Installation',
+      event: 'Positionsreset gesendet',
+      register: 4009,
+      actual: 0,
+      result: 'COMMAND_SENT',
+      details:
+      'Übertragung bestätigt; Wirkung des Positionsresets '
+          'nicht unabhängig verifiziert.',
+    );
+
+    await _pause(const Duration(milliseconds: 500));
+
+    final moving = await _read(12503);
+    final pwm = await _read(31087);
+    final error = await _read(12002);
+    final reference = await _read(12010);
+
+    final okay = moving == 0 && pwm == 0 && error == 0;
+
+    await _record(
+      stage: 'Installation',
+      event: 'Zustand nach Positionsreset',
+      actual:
+      'Bewegung=$moving; PWM=$pwm; '
+          'Fehler=$error; Referenzstatus=$reference',
+      result: okay ? 'OUTPUTS_OK' : 'FAIL',
+    );
+
+    if (!okay) {
+      throw StateError(
+        'Unzulässiger Zustand nach Positionsreset: '
+            'Bewegung=$moving; PWM=$pwm; Fehler=$error.',
       );
     }
   }
@@ -667,101 +973,183 @@ class FunctionalTestRunner {
       throw StateError('Prüfung läuft bereits.');
     }
 
+    if (history.operatorName.trim().isEmpty) {
+      throw StateError('Bitte zuerst den Prüfer eintragen.');
+    }
+
     _running = true;
 
-    var passed = false;
-    var stopped = false;
+    var status = 'FAIL';
+    var message = '';
+    var outputsStopped = false;
     var csvSaved = false;
-    var reason = '';
+    var functionPassed = false;
+    var thresholdRestored = false;
+    var finalPreparationSent = false;
+    var temporaryThresholdAttempted = false;
+
+    void addMessage(String text) {
+      message = message.trim().isEmpty ? text : '$message $text';
+    }
 
     try {
       await _record(
-        'Funktionsprüfung',
-        'Prüfung gestartet; Vorrichtung bestätigt',
+        stage: 'Funktionsprüfung',
+        event: 'Start',
         result: 'IN_PROGRESS',
-        details: 'UP=5 s; DOWN=5 s; '
-            'PWM=$lowPwm bis $highPwm; '
-            'Installation zurückgestellt.',
+        details:
+        'Referenzfahrt mit Schwelle 200; '
+            'UP/DOWN; Beleuchtung; Wiederherstellung 7000; '
+            'Konfiguration speichern; Positionsreset.',
       );
 
-      await _verifyIdentityAndParameters();
+      await _verifyParameters();
+
+      // Stop/exit a previous reference operation first.
+      await _prepareNormalMode();
+
+      temporaryThresholdAttempted = true;
+      await _setReferenceThreshold(testReferenceThreshold);
+
+      await _performInitialReferenceRun();
+
+      // Confirm Normal mode before UP/DOWN.
       await _prepareNormalMode();
 
       await _move(up: true);
 
-      onProgress('Stillstand und Pause vor Richtungswechsel …');
-      await _waitUntilStopped();
-      await _pause(reversalPause);
+      onProgress('Richtungspause …');
+      await _pause(const Duration(seconds: 1));
 
       await _move(up: false);
-
       await _lighting();
 
-      passed = true;
-      reason = 'Parameter-, Bewegungs- und '
-          'visuelle Beleuchtungsprüfung bestanden.';
+      functionPassed = true;
     } catch (error) {
-      reason = error.toString();
-    } finally {
-      onProgress('Ausgänge stoppen und Endzustand prüfen …');
-
-      try {
-        await _stopAllOutputs();
-        await _waitUntilStopped();
-
-        final moving = await io.read(12503);
-        final pwm = await io.read(31087);
-        final error = await io.read(12002);
-
-        stopped = moving == 0 && pwm == 0;
-
-        if (!stopped || error != 0) {
-          passed = false;
-          reason = '$reason '
-              'Endzustand: 12503=$moving; '
-              '31087=$pwm; 12002=$error.';
-        }
-      } catch (error) {
-        passed = false;
-        stopped = false;
-        reason = '$reason Endzustand nicht bestätigt: $error';
-      }
-
-      final status = _abortRequested
-          ? 'ABORTED'
-          : passed && stopped
-          ? 'FUNCTION_PASS_INSTALLATION_PENDING'
-          : 'FAIL';
-
-      try {
-        await _record(
-          'Funktionsprüfung',
-          'Abgeschlossen',
-          result: status,
-          details: reason,
-        );
-
-        await _record(
-          'Endzustand',
-          'Stillstand und PWM-Aus',
-          result: stopped ? 'VERIFIED' : 'NOT_VERIFIED',
-          details: 'Installationsvorbereitung nicht durchgeführt.',
-        );
-
-        await history.ensureSaved();
-        csvSaved = true;
-      } catch (error) {
-        reason = '$reason CSV-Speicherfehler: $error';
-      }
-
-      _running = false;
-
-      return FunctionalTestResult(
-        status: status,
-        message: reason,
-        outputsVerifiedStopped: stopped,
-        csvSaved: csvSaved,
-      );
+      addMessage(error.toString());
     }
+
+    onProgress('Ausgänge stoppen und Stillstand prüfen …');
+
+    try {
+      await _stopAllOutputs();
+      await _waitUntilStopped();
+
+      final moving = await io.read(12503);
+      final pwm = await io.read(31087);
+      final error = await io.read(12002);
+
+      outputsStopped = moving == 0 && pwm == 0;
+
+      await _record(
+        stage: 'Endzustand',
+        event: 'Stillstand und PWM-Aus',
+        expected: 'Bewegung=0; PWM=0',
+        actual: 'Bewegung=$moving; PWM=$pwm',
+        result: outputsStopped ? 'VERIFIED' : 'FAIL',
+        details: 'Fehlerstatus=$error',
+      );
+
+      if (!outputsStopped || error != 0) {
+        functionPassed = false;
+
+        addMessage(
+          'Endzustand nicht fehlerfrei: '
+              'Bewegung=$moving; PWM=$pwm; Fehler=$error.',
+        );
+      }
+    } catch (error) {
+      functionPassed = false;
+      outputsStopped = false;
+      addMessage('Abschaltung/Endprüfung: $error');
+    }
+
+    // Restore even if the test failed or was aborted.
+    if (temporaryThresholdAttempted) {
+      try {
+        await _restoreReferenceThreshold();
+        thresholdRestored = true;
+      } catch (error) {
+        functionPassed = false;
+
+        addMessage(
+          'Wiederherstellung der Referenz-Stromschwelle '
+              'nicht bestätigt: $error',
+        );
+      }
+    }
+
+    if (functionPassed &&
+        outputsStopped &&
+        thresholdRestored &&
+        !_abortRequested) {
+      try {
+        await _saveFinalConfiguration();
+        await _prepareCustomerInstallation();
+
+        finalPreparationSent = true;
+      } catch (error) {
+        addMessage('Abschließende Vorbereitung: $error');
+
+        try {
+          await _stopAllOutputs();
+          await _waitUntilStopped();
+
+          final moving = await io.read(12503);
+          final pwm = await io.read(31087);
+
+          outputsStopped = moving == 0 && pwm == 0;
+        } catch (_) {
+          outputsStopped = false;
+        }
+      }
+    }
+
+    if (_abortRequested) {
+      status = 'ABORTED';
+      addMessage('Prüfung durch Bediener abgebrochen.');
+    } else if (functionPassed &&
+        outputsStopped &&
+        thresholdRestored &&
+        finalPreparationSent) {
+      status = 'FUNCTION_PASS_INSTALLATION_PENDING';
+
+      message =
+      'Referenzfahrt, Parameter, Bewegung und Beleuchtung '
+          'bestanden. Referenz-Stromschwelle 7000 zurückgelesen. '
+          'Speicherbefehl und Positionsreset gesendet. '
+          'Flash-Persistenz und Wirkung des Positionsresets '
+          'sind noch nicht unabhängig verifiziert.';
+    } else {
+      status = 'FAIL';
+
+      if (message.trim().isEmpty) {
+        message = 'Prüfung nicht vollständig bestanden.';
+      }
+    }
+
+    try {
+      await _record(
+        stage: 'Funktionsprüfung',
+        event: 'Abgeschlossen',
+        result: status,
+        details: message.trim(),
+      );
+
+      await history.ensureSaved();
+      csvSaved = true;
+    } catch (error) {
+      addMessage('CSV-Speicherung fehlgeschlagen: $error');
+    }
+
+    _running = false;
+    onProgress('Prüfung beendet.');
+
+    return FunctionalTestResult(
+      status: status,
+      message: message.trim(),
+      outputsVerifiedStopped: outputsStopped,
+      csvSaved: csvSaved,
+    );
   }
 }

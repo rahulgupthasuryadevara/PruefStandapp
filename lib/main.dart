@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'screens/bluetooth_page.dart';
+import 'screens/test_history_page.dart';
 
 
 void main() {
@@ -198,7 +199,20 @@ class _NewTestPageState extends State<NewTestPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const KettererHeader(title: 'Ketterer Prüfstand'),
+        title: const Text('Ketterer Prüfstand'),
+        actions: [
+          IconButton(
+            tooltip: 'Prüfhistorie / CSV exportieren',
+            icon: const Icon(Icons.history),
+            onPressed: () {
+              Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) => const TestHistoryPage(),
+                ),
+              );
+            },
+          ),
+        ],
       ),
       body: SafeArea(
         child: Center(
