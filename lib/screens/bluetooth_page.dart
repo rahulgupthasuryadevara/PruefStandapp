@@ -5,6 +5,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 
+import '../models/test_session.dart';
+import '../services/station_service.dart';
+import 'parameter_check_page.dart';
+
 class BluetoothPage extends StatefulWidget {
   final String casingNumber;
 
@@ -40,8 +44,14 @@ class _BluetoothPageState extends State<BluetoothPage> {
   BluetoothDevice? _device;
   BluetoothCharacteristic? _writeCharacteristic;
 
+  final Map<int, Completer<int>> _pendingReads = {};
+
   Timer? _statusPollTimer;
 
+  late TestSession _testSession;
+
+  bool _stationReady = false;
+  bool _stationInitializing = false;
   bool _scanning = false;
   bool _busy = false;
   bool _ready = false;
@@ -51,15 +61,12 @@ class _BluetoothPageState extends State<BluetoothPage> {
 
   int _session = 0;
 
-  String _status = 'Steuerung einschalten und Scan starten.';
+  String _status = 'Prüfstation wird vorbereitet …';
   String _receiveBuffer = '';
   String _deviceName = '';
 
   int? _serialLow;
   int? _serialMid;
-  int? _firmware;
-  int? _errorCode;
-  int? _referenceState;
 
   DateTime? _lastResponseAt;
 
@@ -75,6 +82,12 @@ class _BluetoothPageState extends State<BluetoothPage> {
   @override
   void initState() {
     super.initState();
+
+    _testSession = TestSession.create(widget.casingNumber);
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _initializeStation();
+    });
 
     _scanSubscription = FlutterBluePlus.onScanResults.listen(
           (results) {
@@ -102,20 +115,17 @@ class _BluetoothPageState extends State<BluetoothPage> {
     _scanStateSubscription = FlutterBluePlus.isScanning.listen(
           (scanning) {
         if (!mounted || _disposed) return;
-
         setState(() => _scanning = scanning);
       },
     );
   }
 
-  // Logs remain in Android Studio, but are not displayed in the app.
   void _log(String message) {
     debugPrint('BLE: $message');
   }
 
   void _setStatus(String message) {
     if (!mounted || _disposed) return;
-
     setState(() => _status = message);
   }
 
@@ -141,6 +151,151 @@ class _BluetoothPageState extends State<BluetoothPage> {
     }
   }
 
+  // ---------- Station setup and test numbering ----------
+
+  Future<int?> _showStationSetup() async {
+    int? selectedStation;
+
+    final formKey = GlobalKey<FormState>();
+
+    return showDialog<int>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) {
+        return AlertDialog(
+          title: const Text('Prüfstation einrichten'),
+          content: SingleChildScrollView(
+            child: Form(
+              key: formKey,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Diese Einstellung ist nur einmal erforderlich.\n\n'
+                        'Jedes Prüfgerät benötigt eine eigene '
+                        'Prüfstationsnummer. Bitte die zugewiesene '
+                        'Nummer eingeben.',
+                  ),
+                  const SizedBox(height: 20),
+                  TextFormField(
+                    autofocus: true,
+                    keyboardType: TextInputType.number,
+                    maxLength: 2,
+                    decoration: const InputDecoration(
+                      labelText: 'Prüfstationsnummer',
+                      hintText: 'Zum Beispiel: 01',
+                      border: OutlineInputBorder(),
+                    ),
+                    validator: (text) {
+                      final value = int.tryParse(
+                        text?.trim() ?? '',
+                      );
+
+                      if (value == null ||
+                          value < 1 ||
+                          value > 99) {
+                        return 'Eine Nummer von 01 bis 99 eingeben.';
+                      }
+
+                      return null;
+                    },
+                    onSaved: (text) {
+                      selectedStation = int.parse(text!.trim());
+                    },
+                  ),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.pop(dialogContext);
+              },
+              child: const Text('Später'),
+            ),
+            FilledButton(
+              onPressed: () {
+                if (!formKey.currentState!.validate()) return;
+
+                formKey.currentState!.save();
+
+                Navigator.pop(
+                  dialogContext,
+                  selectedStation,
+                );
+              },
+              child: const Text('Speichern'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Future<void> _initializeStation() async {
+    if (!mounted ||
+        _disposed ||
+        _stationInitializing ||
+        _stationReady) {
+      return;
+    }
+
+    setState(() {
+      _stationInitializing = true;
+      _status = 'Prüfstation wird vorbereitet …';
+    });
+
+    try {
+      final existingStation =
+      await StationService.getStationNumber();
+
+      if (!mounted || _disposed) return;
+
+      if (existingStation == null) {
+        final enteredStation = await _showStationSetup();
+
+        if (!mounted || _disposed) return;
+
+        if (enteredStation == null) {
+          _setStatus(
+            'Bitte zuerst die Prüfstation einrichten.',
+          );
+          return;
+        }
+
+        await StationService.configure(enteredStation);
+      }
+
+      if (!mounted || _disposed) return;
+
+      final allocation = await StationService.allocateNumber();
+
+      if (!mounted || _disposed) return;
+
+      setState(() {
+        _testSession = _testSession.withTestNumber(
+          allocation.testNumber,
+          allocation.stationNumber,
+        );
+
+        _stationReady = true;
+        _status = 'Steuerung einschalten und Scan starten.';
+      });
+    } catch (error) {
+      _setStatus(
+        'Prüfstation konnte nicht vorbereitet werden: $error',
+      );
+    } finally {
+      if (mounted && !_disposed) {
+        setState(() => _stationInitializing = false);
+      }
+    }
+  }
+
+  // ---------- Bluetooth scan ----------
+
   Future<bool> _requestPermissions() async {
     final android = await DeviceInfoPlugin().androidInfo;
 
@@ -160,7 +315,12 @@ class _BluetoothPageState extends State<BluetoothPage> {
   }
 
   Future<void> _scan() async {
-    if (_busy || _scanning || _device != null) return;
+    if (!_stationReady ||
+        _busy ||
+        _scanning ||
+        _device != null) {
+      return;
+    }
 
     setState(() {
       _busy = true;
@@ -171,7 +331,8 @@ class _BluetoothPageState extends State<BluetoothPage> {
     try {
       if (!await _requestPermissions()) {
         _setStatus(
-          'Berechtigung fehlt. Bitte in den App-Einstellungen erlauben.',
+          'Berechtigung fehlt. '
+              'Bitte in den App-Einstellungen erlauben.',
         );
         return;
       }
@@ -198,7 +359,6 @@ class _BluetoothPageState extends State<BluetoothPage> {
       if (!mounted || _disposed) return;
 
       _setStatus('Suche nach LMC-Steuerungen …');
-      _log('Scan gestartet');
 
       await FlutterBluePlus.startScan(
         timeout: const Duration(seconds: 10),
@@ -216,9 +376,7 @@ class _BluetoothPageState extends State<BluetoothPage> {
   String _name(ScanResult result) {
     final advertisedName = result.advertisementData.advName;
 
-    if (advertisedName.isNotEmpty) {
-      return advertisedName;
-    }
+    if (advertisedName.isNotEmpty) return advertisedName;
 
     final platformName = result.device.platformName;
 
@@ -226,6 +384,8 @@ class _BluetoothPageState extends State<BluetoothPage> {
         ? 'Unbenannte Steuerung'
         : platformName;
   }
+
+  // ---------- Receiving register responses ----------
 
   void _handleReceivedBytes(
       List<int> bytes,
@@ -255,30 +415,24 @@ class _BluetoothPageState extends State<BluetoothPage> {
       final register = int.parse(match.group(1)!);
       final value = int.parse(match.group(2)!);
 
+      final pending = _pendingReads.remove(register);
+
+      if (pending != null && !pending.isCompleted) {
+        pending.complete(value);
+      }
+
       if (!mounted || _disposed) return;
 
       setState(() {
         _lastResponseAt = DateTime.now();
 
         switch (register) {
-          case 102:
-            _firmware = value;
-            break;
-
           case 104:
             _serialLow = value;
             break;
 
           case 105:
             _serialMid = value;
-            break;
-
-          case 12002:
-            _errorCode = value;
-            break;
-
-          case 12010:
-            _referenceState = value;
             break;
         }
       });
@@ -289,6 +443,8 @@ class _BluetoothPageState extends State<BluetoothPage> {
       _log('Empfangspuffer geleert: Zeilenende fehlt');
     }
   }
+
+  // ---------- Sending register reads ----------
 
   Future<void> _sendRead(
       int register,
@@ -316,11 +472,13 @@ class _BluetoothPageState extends State<BluetoothPage> {
 
       _log('TX: ${command.trim()}');
 
-      await characteristic.write(
+      await characteristic
+          .write(
         command.codeUnits,
         withoutResponse:
         characteristic.properties.writeWithoutResponse,
-      ).timeout(const Duration(seconds: 2));
+      )
+          .timeout(const Duration(seconds: 2));
 
       _checkConnection(device, session);
     } finally {
@@ -372,8 +530,6 @@ class _BluetoothPageState extends State<BluetoothPage> {
 
           if (!_isCurrentSession(device, session)) return;
 
-          _log('Statusabfrage fehlgeschlagen: $error');
-
           setState(() {
             _ready = false;
             _status = 'Statusabfrage fehlgeschlagen: $error';
@@ -381,8 +537,6 @@ class _BluetoothPageState extends State<BluetoothPage> {
         }
       },
     );
-
-    _log('Statusabfrage gestartet: alle 1 Sekunde');
   }
 
   Future<void> _clearListeners() async {
@@ -402,8 +556,10 @@ class _BluetoothPageState extends State<BluetoothPage> {
     _receiveBuffer = '';
   }
 
+  // ---------- Connection ----------
+
   Future<void> _connect(ScanResult result) async {
-    if (_busy || _device != null) return;
+    if (!_stationReady || _busy || _device != null) return;
 
     final device = result.device;
     final session = ++_session;
@@ -413,9 +569,6 @@ class _BluetoothPageState extends State<BluetoothPage> {
       _ready = false;
       _serialLow = null;
       _serialMid = null;
-      _firmware = null;
-      _errorCode = null;
-      _referenceState = null;
       _lastResponseAt = null;
       _deviceName = _name(result);
       _status = 'Verbindung zu $_deviceName …';
@@ -423,8 +576,6 @@ class _BluetoothPageState extends State<BluetoothPage> {
 
     try {
       await _clearListeners();
-
-      _log('Scan wird gestoppt');
       await FlutterBluePlus.stopScan();
 
       await Future.delayed(
@@ -436,8 +587,6 @@ class _BluetoothPageState extends State<BluetoothPage> {
       }
 
       _device = device;
-
-      _log('Verbindung ohne explizite MTU-Anfrage');
 
       await device.connect(
         autoConnect: false,
@@ -482,7 +631,6 @@ class _BluetoothPageState extends State<BluetoothPage> {
       _checkConnection(device, session);
 
       _setStatus('Kommunikationsdienste werden gesucht …');
-      _log('Discovering services');
 
       final services = await device
           .discoverServices()
@@ -528,14 +676,11 @@ class _BluetoothPageState extends State<BluetoothPage> {
             },
             onError: (Object error) {
               if (!_isCurrentSession(device, session)) return;
-
-              _log('Empfangsfehler: $error');
               _setStatus('Fehler beim Empfang: $error');
             },
           );
 
       _setStatus('Antwortkanal wird aktiviert …');
-      _log('Enabling notifications');
 
       await notifyCharacteristic
           .setNotifyValue(true)
@@ -547,11 +692,9 @@ class _BluetoothPageState extends State<BluetoothPage> {
 
       _checkConnection(device, session);
 
-      _log('Transport ready');
-
-      // Error status, serial number and firmware.
-      // These commands do not change the controller configuration.
-      for (final register in [12002, 104, 105, 102]) {
+      // Initial read commands only.
+      // These do not change controller settings.
+      for (final register in [12002, 104, 105]) {
         await _sendRead(register, device, session);
 
         await Future.delayed(
@@ -574,9 +717,7 @@ class _BluetoothPageState extends State<BluetoothPage> {
 
       try {
         await device.disconnect();
-      } catch (cleanupError) {
-        _log('Fehler beim Aufräumen: $cleanupError');
-      }
+      } catch (_) {}
 
       if (mounted && !_disposed && session == _session) {
         setState(() {
@@ -636,6 +777,30 @@ class _BluetoothPageState extends State<BluetoothPage> {
     }
   }
 
+  Future<void> _waitForWrite(
+      BluetoothDevice device,
+      int session,
+      ) async {
+    final deadline =
+    DateTime.now().add(const Duration(seconds: 3));
+
+    while (_writeBusy) {
+      if (DateTime.now().isAfter(deadline)) {
+        throw TimeoutException(
+          'Vorherige Bluetooth-Abfrage nicht abgeschlossen.',
+        );
+      }
+
+      await Future.delayed(
+        const Duration(milliseconds: 50),
+      );
+
+      _checkConnection(device, session);
+    }
+
+    _checkConnection(device, session);
+  }
+
   Future<void> _readDeviceDataAgain() async {
     final device = _device;
 
@@ -647,32 +812,14 @@ class _BluetoothPageState extends State<BluetoothPage> {
     _statusPollTimer?.cancel();
 
     try {
-      final deadline =
-      DateTime.now().add(const Duration(seconds: 3));
-
-      while (_writeBusy) {
-        if (DateTime.now().isAfter(deadline)) {
-          throw TimeoutException(
-            'Vorherige Schreiboperation nicht abgeschlossen.',
-          );
-        }
-
-        await Future.delayed(
-          const Duration(milliseconds: 50),
-        );
-
-        _checkConnection(device, session);
-      }
-
-      _checkConnection(device, session);
+      await _waitForWrite(device, session);
 
       setState(() {
         _serialLow = null;
         _serialMid = null;
-        _firmware = null;
       });
 
-      for (final register in [104, 105, 102]) {
+      for (final register in [104, 105]) {
         await _sendRead(register, device, session);
 
         await Future.delayed(
@@ -680,8 +827,9 @@ class _BluetoothPageState extends State<BluetoothPage> {
         );
       }
     } catch (error) {
-      _setStatus('Gerätedaten-Abfrage fehlgeschlagen: $error');
-      _log('Gerätedaten-Abfrage: $error');
+      _setStatus(
+        'Seriennummer-Abfrage fehlgeschlagen: $error',
+      );
     } finally {
       if (_isCurrentSession(device, session) &&
           device.isConnected &&
@@ -693,6 +841,156 @@ class _BluetoothPageState extends State<BluetoothPage> {
         setState(() => _busy = false);
       }
     }
+  }
+
+  // ---------- Parameter reads ----------
+
+  Future<int> _readRegisterAndWait(
+      int register,
+      BluetoothDevice device,
+      int session,
+      ) async {
+    _checkConnection(device, session);
+
+    if (_pendingReads.containsKey(register)) {
+      throw StateError(
+        'Register $register wird bereits abgefragt.',
+      );
+    }
+
+    final completer = Completer<int>();
+    _pendingReads[register] = completer;
+
+    final response = completer.future.timeout(
+      const Duration(seconds: 3),
+      onTimeout: () {
+        throw TimeoutException(
+          'Keine Antwort für Register $register.',
+        );
+      },
+    );
+
+    try {
+      final results = await Future.wait<Object?>(
+        [
+          _sendRead(register, device, session).then<Object?>(
+                (_) => null,
+          ),
+          response.then<Object?>((value) => value),
+        ],
+        eagerError: true,
+      );
+
+      _checkConnection(device, session);
+
+      return results[1] as int;
+    } finally {
+      if (identical(_pendingReads[register], completer)) {
+        _pendingReads.remove(register);
+      }
+    }
+  }
+
+  Future<Map<int, int>> _readParameterValues() async {
+    final device = _device;
+
+    if (device == null || !_ready || _busy) {
+      throw StateError(
+        'Steuerung nicht bereit. Bitte erneut verbinden.',
+      );
+    }
+
+    final session = _session;
+
+    setState(() => _busy = true);
+    _statusPollTimer?.cancel();
+
+    try {
+      await _waitForWrite(device, session);
+
+      await Future.delayed(
+        const Duration(milliseconds: 200),
+      );
+
+      _checkConnection(device, session);
+
+      final values = <int, int>{};
+
+      for (final register in [
+        30001,
+        20000,
+        20010,
+        20012,
+        102,
+        104,
+        105,
+        12002,
+        12010,
+      ]) {
+        values[register] = await _readRegisterAndWait(
+          register,
+          device,
+          session,
+        );
+
+        await Future.delayed(
+          const Duration(milliseconds: 100),
+        );
+      }
+
+      final serial =
+      (values[105]! * 65536 + values[104]!).toString();
+
+      if (serial != _testSession.controllerSerial) {
+        throw StateError(
+          'Steuerungsseriennummer stimmt nicht '
+              'mit der Zuordnung überein.',
+        );
+      }
+
+      return values;
+    } finally {
+      if (_isCurrentSession(device, session) &&
+          device.isConnected &&
+          _ready) {
+        _startStatusPolling(device, session);
+      }
+
+      if (mounted && !_disposed && session == _session) {
+        setState(() => _busy = false);
+      }
+    }
+  }
+
+  void _openParameterCheck() {
+    if (!_stationReady ||
+        _device == null ||
+        !_ready ||
+        _busy ||
+        _serialNumber == null) {
+      return;
+    }
+
+    try {
+      _testSession = _testSession.pairWith(
+        _serialNumber!.toString(),
+      );
+    } catch (error) {
+      _setStatus(error.toString());
+      return;
+    }
+
+    setState(() {});
+
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => ParameterCheckPage(
+          casingNumber: widget.casingNumber,
+          testSession: _testSession,
+          readValues: _readParameterValues,
+        ),
+      ),
+    );
   }
 
   @override
@@ -754,14 +1052,65 @@ class _BluetoothPageState extends State<BluetoothPage> {
       body: ListView(
         padding: const EdgeInsets.all(20),
         children: [
-          Text(
-            'Gehäuse: ${widget.casingNumber}',
-            style: const TextStyle(
-              fontSize: 20,
-              fontWeight: FontWeight.bold,
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Gehäuse: ${widget.casingNumber}',
+                    style: const TextStyle(
+                      fontSize: 20,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  SelectableText(
+                    'Prüfungsnummer: '
+                        '${_testSession.displayNumber}',
+                    style: const TextStyle(
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  if (_stationReady) ...[
+                    const SizedBox(height: 8),
+                    Text(
+                      'Prüfstation: '
+                          '${_testSession.stationNumber!.toString().padLeft(2, '0')}',
+                    ),
+                  ],
+                  const SizedBox(height: 10),
+                  Text(
+                    _testSession.controllerSerial == null
+                        ? 'Zuordnung erfolgt mit '
+                        '„Zuordnen und weiter“.'
+                        : 'Zugeordnet: '
+                        '${_testSession.casingNumber}'
+                        ' ↔ ${_testSession.controllerSerial}',
+                  ),
+                ],
+              ),
             ),
           ),
+
+          if (!_stationReady) ...[
+            const SizedBox(height: 12),
+            FilledButton.icon(
+              onPressed: _stationInitializing
+                  ? null
+                  : _initializeStation,
+              icon: const Icon(Icons.settings),
+              label: Text(
+                _stationInitializing
+                    ? 'Bitte warten …'
+                    : 'Prüfstation einrichten',
+              ),
+            ),
+          ],
+
           const SizedBox(height: 16),
+
           Card(
             child: ListTile(
               leading: Icon(
@@ -779,13 +1128,19 @@ class _BluetoothPageState extends State<BluetoothPage> {
                   : null,
             ),
           ),
+
           const SizedBox(height: 16),
+
           if (!connected)
             FilledButton.icon(
-              onPressed: _busy || _scanning ? null : _scan,
+              onPressed: !_stationReady || _busy || _scanning
+                  ? null
+                  : _scan,
               icon: const Icon(Icons.search),
               label: Text(
-                _scanning ? 'Scan läuft …' : 'LMC-Geräte suchen',
+                _scanning
+                    ? 'Scan läuft …'
+                    : 'LMC-Geräte suchen',
               ),
             )
           else
@@ -794,11 +1149,14 @@ class _BluetoothPageState extends State<BluetoothPage> {
               icon: const Icon(Icons.bluetooth_disabled),
               label: const Text('Verbindung trennen'),
             ),
-          if (_busy || _scanning) ...[
+
+          if (_busy || _scanning || _stationInitializing) ...[
             const SizedBox(height: 16),
             const LinearProgressIndicator(),
           ],
+
           const SizedBox(height: 16),
+
           if (!connected)
             ..._results.map(
                   (result) => Card(
@@ -813,11 +1171,15 @@ class _BluetoothPageState extends State<BluetoothPage> {
                         ' • ${result.rssi} dBm',
                   ),
                   trailing: const Icon(Icons.chevron_right),
-                  onTap: _busy ? null : () => _connect(result),
+                  onTap: !_stationReady || _busy
+                      ? null
+                      : () => _connect(result),
                 ),
               ),
             ),
-          if (!_scanning &&
+
+          if (_stationReady &&
+              !_scanning &&
               !_busy &&
               !connected &&
               _results.isEmpty)
@@ -828,49 +1190,47 @@ class _BluetoothPageState extends State<BluetoothPage> {
                     'werden angezeigt.',
               ),
             ),
+
           if (connected) ...[
             Card(
               child: Padding(
                 padding: const EdgeInsets.all(16),
-                child: Column(
-                  children: [
-                    _valueRow(
-                      'Steuerungsseriennummer',
-                      _serialNumber?.toString() ??
-                          'Noch nicht gelesen',
-                    ),
-                    const Divider(),
-                    _valueRow(
-                      'Firmwareversion (Register 102)',
-                      _firmware?.toString() ??
-                          'Noch nicht gelesen',
-                    ),
-                    const Divider(),
-                    _valueRow(
-                      'Fehlerstatus (12002)',
-                      _errorCode?.toString() ?? '—',
-                    ),
-                    _valueRow(
-                      'Referenzstatus (12010, Rohwert)',
-                      _referenceState?.toString() ?? '—',
-                    ),
-                  ],
+                child: _valueRow(
+                  'Steuerungsseriennummer',
+                  _serialNumber?.toString() ??
+                      'Noch nicht gelesen',
                 ),
               ),
             ),
             const SizedBox(height: 12),
             OutlinedButton.icon(
-              onPressed:
-              _ready && !_busy ? _readDeviceDataAgain : null,
+              onPressed: _ready && !_busy
+                  ? _readDeviceDataAgain
+                  : null,
               icon: const Icon(Icons.refresh),
-              label: const Text('Gerätedaten erneut lesen'),
+              label: const Text('Seriennummer erneut lesen'),
+            ),
+            const SizedBox(height: 12),
+            FilledButton.icon(
+              onPressed: _stationReady &&
+                  _ready &&
+                  !_busy &&
+                  _serialNumber != null
+                  ? _openParameterCheck
+                  : null,
+              icon: const Icon(Icons.link),
+              label: const Text('Zuordnen und weiter'),
             ),
           ],
+
           const SizedBox(height: 20),
+
           const Text(
-            'Entwicklungsversion: Die Werte werden noch nicht '
-                'dauerhaft gespeichert. Beim Verlassen dieser Seite '
-                'wird die Bluetooth-Verbindung getrennt.',
+            'Prüfstation und Nummernzähler werden lokal '
+                'gespeichert. Die aktuelle Zuordnung und '
+                'Prüfergebnisse sind bisher nur im Arbeitsspeicher. '
+                'Beim Verlassen dieser Seite wird die '
+                'Bluetooth-Verbindung getrennt.',
             style: TextStyle(
               color: Color(0xFF6B7581),
               fontSize: 13,
