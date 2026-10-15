@@ -28,14 +28,9 @@ class TestSession {
     );
   }
 
-  String get displayNumber {
-    return testNumber ?? 'Wird angelegt …';
-  }
+  String get displayNumber => testNumber ?? 'Wird angelegt …';
 
-  TestSession withTestNumber(
-      String number,
-      int station,
-      ) {
+  TestSession withTestNumber(String number, int station) {
     if (testNumber != null &&
         (testNumber != number || stationNumber != station)) {
       throw StateError(
@@ -60,8 +55,7 @@ class TestSession {
       );
     }
 
-    if (controllerSerial != null &&
-        controllerSerial != serial) {
+    if (controllerSerial != null && controllerSerial != serial) {
       throw StateError(
         'Andere Steuerung erkannt. '
             'Bitte eine neue Prüfung anlegen.',
@@ -80,9 +74,7 @@ class TestSession {
 
   Map<String, Object?> toJson() {
     if (testNumber == null) {
-      throw StateError(
-        'Prüfung ohne Prüfungsnummer kann nicht gespeichert werden.',
-      );
+      throw StateError('Prüfungsnummer fehlt.');
     }
 
     return {

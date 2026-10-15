@@ -7,7 +7,12 @@ import 'package:permission_handler/permission_handler.dart';
 
 import '../models/test_session.dart';
 import '../services/station_service.dart';
+import '../services/test_history.dart';
 import 'parameter_check_page.dart';
+import 'test_history_page.dart';
+import '../services/functional_test_runner.dart';
+import 'functional_test_page.dart';
+
 
 class BluetoothPage extends StatefulWidget {
   final String casingNumber;
@@ -26,10 +31,8 @@ class _BluetoothPageState extends State<BluetoothPage> {
 
   static final uartService =
   Guid('6e400001-b5a3-f393-e0a9-e50e24dcca9e');
-
   static final uartWrite =
   Guid('6e400002-b5a3-f393-e0a9-e50e24dcca9e');
-
   static final uartNotify =
   Guid('6e400003-b5a3-f393-e0a9-e50e24dcca9e');
 
@@ -45,10 +48,12 @@ class _BluetoothPageState extends State<BluetoothPage> {
   BluetoothCharacteristic? _writeCharacteristic;
 
   final Map<int, Completer<int>> _pendingReads = {};
+  Future<void> _functionalWriteTail = Future<void>.value();
 
   Timer? _statusPollTimer;
 
   late TestSession _testSession;
+  TestHistory? _history;
 
   bool _stationReady = false;
   bool _stationInitializing = false;
@@ -67,7 +72,6 @@ class _BluetoothPageState extends State<BluetoothPage> {
 
   int? _serialLow;
   int? _serialMid;
-
   DateTime? _lastResponseAt;
 
   int? get _serialNumber {
@@ -96,7 +100,6 @@ class _BluetoothPageState extends State<BluetoothPage> {
         final filtered = results.where((result) {
           final advertisedName =
           result.advertisementData.advName.toUpperCase();
-
           final platformName =
           result.device.platformName.toUpperCase();
 
@@ -109,6 +112,7 @@ class _BluetoothPageState extends State<BluetoothPage> {
       },
       onError: (Object error) {
         _setStatus('Scanfehler: $error');
+        _log('Scanfehler: $error');
       },
     );
 
@@ -122,6 +126,12 @@ class _BluetoothPageState extends State<BluetoothPage> {
 
   void _log(String message) {
     debugPrint('BLE: $message');
+
+    _history?.recordBackground(
+      stage: 'Bluetooth',
+      event: 'Kommunikation',
+      details: message,
+    );
   }
 
   void _setStatus(String message) {
@@ -151,11 +161,8 @@ class _BluetoothPageState extends State<BluetoothPage> {
     }
   }
 
-  // ---------- Station setup and test numbering ----------
-
   Future<int?> _showStationSetup() async {
     int? selectedStation;
-
     final formKey = GlobalKey<FormState>();
 
     return showDialog<int>(
@@ -188,14 +195,13 @@ class _BluetoothPageState extends State<BluetoothPage> {
                       border: OutlineInputBorder(),
                     ),
                     validator: (text) {
-                      final value = int.tryParse(
-                        text?.trim() ?? '',
-                      );
+                      final value =
+                      int.tryParse(text?.trim() ?? '');
 
                       if (value == null ||
                           value < 1 ||
                           value > 99) {
-                        return 'Eine Nummer von 01 bis 99 eingeben.';
+                        return 'Nummer von 01 bis 99 eingeben.';
                       }
 
                       return null;
@@ -210,9 +216,7 @@ class _BluetoothPageState extends State<BluetoothPage> {
           ),
           actions: [
             TextButton(
-              onPressed: () {
-                Navigator.pop(dialogContext);
-              },
+              onPressed: () => Navigator.pop(dialogContext),
               child: const Text('Später'),
             ),
             FilledButton(
@@ -221,10 +225,7 @@ class _BluetoothPageState extends State<BluetoothPage> {
 
                 formKey.currentState!.save();
 
-                Navigator.pop(
-                  dialogContext,
-                  selectedStation,
-                );
+                Navigator.pop(dialogContext, selectedStation);
               },
               child: const Text('Speichern'),
             ),
@@ -248,24 +249,22 @@ class _BluetoothPageState extends State<BluetoothPage> {
     });
 
     try {
-      final existingStation =
+      final existing =
       await StationService.getStationNumber();
 
       if (!mounted || _disposed) return;
 
-      if (existingStation == null) {
-        final enteredStation = await _showStationSetup();
+      if (existing == null) {
+        final entered = await _showStationSetup();
 
         if (!mounted || _disposed) return;
 
-        if (enteredStation == null) {
-          _setStatus(
-            'Bitte zuerst die Prüfstation einrichten.',
-          );
+        if (entered == null) {
+          _setStatus('Bitte zuerst die Prüfstation einrichten.');
           return;
         }
 
-        await StationService.configure(enteredStation);
+        await StationService.configure(entered);
       }
 
       if (!mounted || _disposed) return;
@@ -274,18 +273,25 @@ class _BluetoothPageState extends State<BluetoothPage> {
 
       if (!mounted || _disposed) return;
 
-      setState(() {
-        _testSession = _testSession.withTestNumber(
-          allocation.testNumber,
-          allocation.stationNumber,
-        );
+      final numberedSession = _testSession.withTestNumber(
+        allocation.testNumber,
+        allocation.stationNumber,
+      );
 
+      final history = await TestHistory.create(numberedSession);
+
+      if (!mounted || _disposed) return;
+
+      setState(() {
+        _testSession = numberedSession;
+        _history = history;
         _stationReady = true;
         _status = 'Steuerung einschalten und Scan starten.';
       });
     } catch (error) {
       _setStatus(
-        'Prüfstation konnte nicht vorbereitet werden: $error',
+        'Prüfstation oder CSV konnte nicht '
+            'vorbereitet werden: $error',
       );
     } finally {
       if (mounted && !_disposed) {
@@ -293,8 +299,6 @@ class _BluetoothPageState extends State<BluetoothPage> {
       }
     }
   }
-
-  // ---------- Bluetooth scan ----------
 
   Future<bool> _requestPermissions() async {
     final android = await DeviceInfoPlugin().androidInfo;
@@ -329,6 +333,8 @@ class _BluetoothPageState extends State<BluetoothPage> {
     });
 
     try {
+      await _history!.ensureSaved();
+
       if (!await _requestPermissions()) {
         _setStatus(
           'Berechtigung fehlt. '
@@ -359,12 +365,13 @@ class _BluetoothPageState extends State<BluetoothPage> {
       if (!mounted || _disposed) return;
 
       _setStatus('Suche nach LMC-Steuerungen …');
+      _log('Scan gestartet');
 
       await FlutterBluePlus.startScan(
         timeout: const Duration(seconds: 10),
       );
     } catch (error) {
-      _setStatus('Scan fehlgeschlagen: $error');
+      _setStatus('Scan oder Speicherung fehlgeschlagen: $error');
       _log('Scanfehler: $error');
     } finally {
       if (mounted && !_disposed) {
@@ -385,8 +392,6 @@ class _BluetoothPageState extends State<BluetoothPage> {
         : platformName;
   }
 
-  // ---------- Receiving register responses ----------
-
   void _handleReceivedBytes(
       List<int> bytes,
       BluetoothDevice device,
@@ -406,9 +411,8 @@ class _BluetoothPageState extends State<BluetoothPage> {
 
       _log('RX: $line');
 
-      final match = RegExp(
-        r'^#R(\d+)=(-?\d+)$',
-      ).firstMatch(line);
+      final match =
+      RegExp(r'^#R(\d+)=(-?\d+)$').firstMatch(line);
 
       if (match == null) continue;
 
@@ -430,7 +434,6 @@ class _BluetoothPageState extends State<BluetoothPage> {
           case 104:
             _serialLow = value;
             break;
-
           case 105:
             _serialMid = value;
             break;
@@ -443,8 +446,6 @@ class _BluetoothPageState extends State<BluetoothPage> {
       _log('Empfangspuffer geleert: Zeilenende fehlt');
     }
   }
-
-  // ---------- Sending register reads ----------
 
   Future<void> _sendRead(
       int register,
@@ -513,14 +514,18 @@ class _BluetoothPageState extends State<BluetoothPage> {
 
           if (!_isCurrentSession(device, session)) return;
 
-          final lastResponse = _lastResponseAt;
+          final last = _lastResponseAt;
 
-          if (lastResponse == null ||
-              DateTime.now().difference(lastResponse) >
+          if (last == null ||
+              DateTime.now().difference(last) >
                   const Duration(seconds: 10)) {
             _setStatus(
               'Bluetooth verbunden, aber keine aktuellen '
                   'Registerantworten.',
+            );
+          } else if (_history?.lastSaveError != null) {
+            _setStatus(
+              'Bluetooth verbunden. CSV-Speicherfehler vorhanden.',
             );
           } else {
             _setStatus('Verbunden. Statusabfragen laufen.');
@@ -529,6 +534,8 @@ class _BluetoothPageState extends State<BluetoothPage> {
           timer.cancel();
 
           if (!_isCurrentSession(device, session)) return;
+
+          _log('Statusabfrage fehlgeschlagen: $error');
 
           setState(() {
             _ready = false;
@@ -543,20 +550,18 @@ class _BluetoothPageState extends State<BluetoothPage> {
     _statusPollTimer?.cancel();
     _statusPollTimer = null;
 
-    final connectionSubscription = _connectionSubscription;
-    final notifySubscription = _notifySubscription;
+    final connection = _connectionSubscription;
+    final notify = _notifySubscription;
 
     _connectionSubscription = null;
     _notifySubscription = null;
 
-    await connectionSubscription?.cancel();
-    await notifySubscription?.cancel();
+    await connection?.cancel();
+    await notify?.cancel();
 
     _writeCharacteristic = null;
     _receiveBuffer = '';
   }
-
-  // ---------- Connection ----------
 
   Future<void> _connect(ScanResult result) async {
     if (!_stationReady || _busy || _device != null) return;
@@ -575,6 +580,7 @@ class _BluetoothPageState extends State<BluetoothPage> {
     });
 
     try {
+      await _history!.ensureSaved();
       await _clearListeners();
       await FlutterBluePlus.stopScan();
 
@@ -582,11 +588,11 @@ class _BluetoothPageState extends State<BluetoothPage> {
         const Duration(milliseconds: 500),
       );
 
-      if (!mounted || _disposed || session != _session) {
-        return;
-      }
+      if (!mounted || _disposed || session != _session) return;
 
       _device = device;
+
+      _log('Verbinden: $_deviceName / ${device.remoteId}');
 
       await device.connect(
         autoConnect: false,
@@ -607,10 +613,8 @@ class _BluetoothPageState extends State<BluetoothPage> {
           if (state == BluetoothConnectionState.disconnected) {
             _statusPollTimer?.cancel();
             _statusPollTimer = null;
-
             _notifySubscription?.cancel();
             _notifySubscription = null;
-
             _writeCharacteristic = null;
             _receiveBuffer = '';
 
@@ -629,7 +633,6 @@ class _BluetoothPageState extends State<BluetoothPage> {
       );
 
       _checkConnection(device, session);
-
       _setStatus('Kommunikationsdienste werden gesucht …');
 
       final services = await device
@@ -638,51 +641,50 @@ class _BluetoothPageState extends State<BluetoothPage> {
 
       _checkConnection(device, session);
 
-      BluetoothCharacteristic? writeCharacteristic;
-      BluetoothCharacteristic? notifyCharacteristic;
+      BluetoothCharacteristic? write;
+      BluetoothCharacteristic? notify;
 
       for (final service in services) {
         if (service.uuid != uartService) continue;
 
         for (final characteristic in service.characteristics) {
           if (characteristic.uuid == uartWrite) {
-            writeCharacteristic = characteristic;
+            write = characteristic;
           }
 
           if (characteristic.uuid == uartNotify) {
-            notifyCharacteristic = characteristic;
+            notify = characteristic;
           }
         }
       }
 
-      if (writeCharacteristic == null ||
-          !(writeCharacteristic.properties.write ||
-              writeCharacteristic.properties.writeWithoutResponse)) {
+      if (write == null ||
+          !(write.properties.write ||
+              write.properties.writeWithoutResponse)) {
         throw StateError('UART-Schreibkanal nicht gefunden.');
       }
 
-      if (notifyCharacteristic == null ||
-          !(notifyCharacteristic.properties.notify ||
-              notifyCharacteristic.properties.indicate)) {
+      if (notify == null ||
+          !(notify.properties.notify ||
+              notify.properties.indicate)) {
         throw StateError('UART-Antwortkanal nicht gefunden.');
       }
 
-      _writeCharacteristic = writeCharacteristic;
+      _writeCharacteristic = write;
 
-      _notifySubscription =
-          notifyCharacteristic.onValueReceived.listen(
-                (bytes) {
-              _handleReceivedBytes(bytes, device, session);
-            },
-            onError: (Object error) {
-              if (!_isCurrentSession(device, session)) return;
-              _setStatus('Fehler beim Empfang: $error');
-            },
-          );
+      _notifySubscription = notify.onValueReceived.listen(
+            (bytes) => _handleReceivedBytes(bytes, device, session),
+        onError: (Object error) {
+          if (!_isCurrentSession(device, session)) return;
+
+          _log('Empfangsfehler: $error');
+          _setStatus('Fehler beim Empfang: $error');
+        },
+      );
 
       _setStatus('Antwortkanal wird aktiviert …');
 
-      await notifyCharacteristic
+      await notify
           .setNotifyValue(true)
           .timeout(const Duration(seconds: 5));
 
@@ -692,8 +694,6 @@ class _BluetoothPageState extends State<BluetoothPage> {
 
       _checkConnection(device, session);
 
-      // Initial read commands only.
-      // These do not change controller settings.
       for (final register in [12002, 104, 105]) {
         await _sendRead(register, device, session);
 
@@ -709,10 +709,10 @@ class _BluetoothPageState extends State<BluetoothPage> {
         _status = 'Verbunden. Statusabfragen laufen.';
       });
 
+      _log('Bluetooth-Transport bereit');
       _startStatusPolling(device, session);
     } catch (error) {
       _log('Setup fehlgeschlagen: $error');
-
       await _clearListeners();
 
       try {
@@ -751,6 +751,7 @@ class _BluetoothPageState extends State<BluetoothPage> {
     });
 
     try {
+      _log('Verbindung manuell trennen');
       await _clearListeners();
       await device.disconnect();
 
@@ -761,12 +762,11 @@ class _BluetoothPageState extends State<BluetoothPage> {
         });
       }
     } catch (error) {
+      _log('Trennen fehlgeschlagen: $error');
+
       if (mounted && !_disposed) {
         setState(() {
-          if (!device.isConnected) {
-            _device = null;
-          }
-
+          if (!device.isConnected) _device = null;
           _status = 'Trennen fehlgeschlagen: $error';
         });
       }
@@ -827,9 +827,8 @@ class _BluetoothPageState extends State<BluetoothPage> {
         );
       }
     } catch (error) {
-      _setStatus(
-        'Seriennummer-Abfrage fehlgeschlagen: $error',
-      );
+      _log('Seriennummer-Abfrage fehlgeschlagen: $error');
+      _setStatus('Seriennummer-Abfrage fehlgeschlagen: $error');
     } finally {
       if (_isCurrentSession(device, session) &&
           device.isConnected &&
@@ -842,8 +841,6 @@ class _BluetoothPageState extends State<BluetoothPage> {
       }
     }
   }
-
-  // ---------- Parameter reads ----------
 
   Future<int> _readRegisterAndWait(
       int register,
@@ -873,9 +870,8 @@ class _BluetoothPageState extends State<BluetoothPage> {
     try {
       final results = await Future.wait<Object?>(
         [
-          _sendRead(register, device, session).then<Object?>(
-                (_) => null,
-          ),
+          _sendRead(register, device, session)
+              .then<Object?>((_) => null),
           response.then<Object?>((value) => value),
         ],
         eagerError: true,
@@ -906,6 +902,7 @@ class _BluetoothPageState extends State<BluetoothPage> {
     _statusPollTimer?.cancel();
 
     try {
+      await _history!.ensureSaved();
       await _waitForWrite(device, session);
 
       await Future.delayed(
@@ -962,8 +959,11 @@ class _BluetoothPageState extends State<BluetoothPage> {
     }
   }
 
-  void _openParameterCheck() {
+  Future<void> _openParameterCheck() async {
+    final history = _history;
+
     if (!_stationReady ||
+        history == null ||
         _device == null ||
         !_ready ||
         _busy ||
@@ -971,30 +971,270 @@ class _BluetoothPageState extends State<BluetoothPage> {
       return;
     }
 
+    setState(() => _busy = true);
+
     try {
-      _testSession = _testSession.pairWith(
+      final paired = _testSession.pairWith(
         _serialNumber!.toString(),
       );
+
+      await history.setPairing(paired);
+
+      if (!mounted || _disposed) return;
+
+      final device = _device;
+
+      if (device == null || !device.isConnected || !_ready) {
+        throw StateError(
+          'Verbindung vor dem Seitenwechsel getrennt.',
+        );
+      }
+
+      setState(() {
+        _testSession = paired;
+        _busy = false;
+      });
+
+      await Navigator.of(context).push(
+        MaterialPageRoute(
+          builder: (_) => ParameterCheckPage(
+            casingNumber: widget.casingNumber,
+            testSession: paired,
+            readValues: _readParameterValues,
+            history: history,
+            runFunctionalTest: _openFunctionalTest,
+          ),
+          ),
+
+      );
     } catch (error) {
-      _setStatus(error.toString());
-      return;
+      _setStatus(
+        'Zuordnung oder Speicherung fehlgeschlagen: $error',
+      );
+    } finally {
+      if (mounted && !_disposed) {
+        setState(() => _busy = false);
+      }
+    }
+  }
+
+  Future<void> _openHistory() async {
+    try {
+      await _history?.ensureSaved();
+
+      if (!mounted || _disposed) return;
+
+      Navigator.of(context).push(
+        MaterialPageRoute(
+          builder: (_) => const TestHistoryPage(),
+        ),
+      );
+    } catch (error) {
+      _setStatus('CSV-Speicherung fehlgeschlagen: $error');
+    }
+  }
+
+  Future<void> _functionalWrite(
+      String command,
+      bool Function() allowed,
+      BluetoothDevice device,
+      int session,
+      ) {
+    final operation = _functionalWriteTail.then((_) async {
+      _checkConnection(device, session);
+
+      await _waitForWrite(device, session);
+
+      // Recheck after waiting, so an expired movement command
+      // cannot restart the drive after a stop was requested.
+      if (!allowed()) return;
+
+      final characteristic = _writeCharacteristic;
+
+      if (characteristic == null) {
+        throw StateError('Bluetooth-Schreibkanal fehlt.');
+      }
+
+      _writeBusy = true;
+
+      try {
+        _log('TX: ${command.trim()}');
+
+        await characteristic
+            .write(
+          command.codeUnits,
+          withoutResponse:
+          characteristic.properties.writeWithoutResponse,
+        )
+            .timeout(const Duration(milliseconds: 700));
+
+        _checkConnection(device, session);
+      } finally {
+        _writeBusy = false;
+      }
+    });
+
+    _functionalWriteTail = operation.then<void>(
+          (_) {},
+      onError: (Object error, StackTrace stackTrace) {},
+    );
+
+    return operation;
+  }
+
+  Future<int> _functionalRead(
+      int register,
+      BluetoothDevice device,
+      int session,
+      ) async {
+    _checkConnection(device, session);
+
+    if (_pendingReads.containsKey(register)) {
+      throw StateError(
+        'Register $register wird bereits gelesen.',
+      );
     }
 
-    setState(() {});
+    final completer = Completer<int>();
+    _pendingReads[register] = completer;
 
-    Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (_) => ParameterCheckPage(
-          casingNumber: widget.casingNumber,
-          testSession: _testSession,
-          readValues: _readParameterValues,
+    final totalTime = Stopwatch()..start();
+
+    try {
+      // Register the response receiver before sending.
+      // An immediate response is therefore retained.
+      await _functionalWrite(
+        '#GR=$register\n',
+            () => true,
+        device,
+        session,
+      );
+
+      _checkConnection(device, session);
+
+      final responseTime = Stopwatch()..start();
+
+      // Start the response timeout AFTER the write completes.
+      final value = await completer.future.timeout(
+        const Duration(seconds: 3),
+        onTimeout: () {
+          throw TimeoutException(
+            'Keine Antwort für Register $register '
+                'innerhalb von 3 Sekunden nach dem Schreiben.',
+          );
+        },
+      );
+
+      _checkConnection(device, session);
+
+      _log(
+        'READ OK: Register $register=$value; '
+            'Antwortzeit=${responseTime.elapsedMilliseconds} ms; '
+            'Gesamtzeit=${totalTime.elapsedMilliseconds} ms',
+      );
+
+      return value;
+    } catch (error) {
+      _log(
+        'READ FAILED: Register $register; '
+            'Gesamtzeit=${totalTime.elapsedMilliseconds} ms; '
+            'Fehler=$error',
+      );
+
+      rethrow;
+    } finally {
+      if (identical(_pendingReads[register], completer)) {
+        _pendingReads.remove(register);
+      }
+    }
+  }
+
+  Future<void> _openFunctionalTest(
+      Map<int, int> approvedValues,
+      ) async {
+    final device = _device;
+    final history = _history;
+
+    if (device == null ||
+        history == null ||
+        !_ready ||
+        _busy ||
+        !device.isConnected) {
+      throw StateError(
+        'Steuerung nicht bereit. Bitte Verbindung prüfen.',
+      );
+    }
+
+    final session = _session;
+
+    setState(() => _busy = true);
+    _statusPollTimer?.cancel();
+
+    try {
+      await _waitForWrite(device, session);
+
+      // Allow a previous polling response to finish.
+      await Future<void>.delayed(
+        const Duration(milliseconds: 250),
+      );
+
+      _checkConnection(device, session);
+      await history.ensureSaved();
+
+      if (!mounted || _disposed) return;
+
+      await Navigator.of(context).push(
+        MaterialPageRoute(
+          builder: (_) => FunctionalTestPage(
+            session: _testSession,
+            history: history,
+            approvedValues: Map<int, int>.from(approvedValues),
+            io: FunctionalTestIo(
+              read: (register) {
+                return _functionalRead(
+                  register,
+                  device,
+                  session,
+                );
+              },
+              write: (command, allowed) {
+                return _functionalWrite(
+                  command,
+                  allowed,
+                  device,
+                  session,
+                );
+              },
+              isConnected: () {
+                return _isCurrentSession(device, session) &&
+                    device.isConnected &&
+                    _ready;
+              },
+            ),
+          ),
         ),
-      ),
-    );
+      );
+    } finally {
+      if (_isCurrentSession(device, session) &&
+          device.isConnected &&
+          _ready) {
+        _startStatusPolling(device, session);
+      }
+
+      if (mounted && !_disposed && session == _session) {
+        setState(() => _busy = false);
+      }
+    }
   }
 
   @override
   void dispose() {
+    _history?.recordBackground(
+      stage: 'Sitzung',
+      event: 'Bluetooth-Seite verlassen',
+      details: 'Kein automatisches Gesamtergebnis vergeben.',
+    );
+
     _disposed = true;
     ++_session;
 
@@ -1019,28 +1259,6 @@ class _BluetoothPageState extends State<BluetoothPage> {
     super.dispose();
   }
 
-  Widget _valueRow(String label, String value) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 8),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Expanded(child: Text(label)),
-          const SizedBox(width: 12),
-          Flexible(
-            child: Text(
-              value,
-              textAlign: TextAlign.right,
-              style: const TextStyle(
-                fontWeight: FontWeight.w600,
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
     final connected = _device != null;
@@ -1048,6 +1266,13 @@ class _BluetoothPageState extends State<BluetoothPage> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('LMC-Steuerung verbinden'),
+        actions: [
+          IconButton(
+            tooltip: 'Prüfhistorie',
+            icon: const Icon(Icons.history),
+            onPressed: _busy ? null : _openHistory,
+          ),
+        ],
       ),
       body: ListView(
         padding: const EdgeInsets.all(20),
@@ -1067,8 +1292,7 @@ class _BluetoothPageState extends State<BluetoothPage> {
                   ),
                   const SizedBox(height: 10),
                   SelectableText(
-                    'Prüfungsnummer: '
-                        '${_testSession.displayNumber}',
+                    'Prüfungsnummer: ${_testSession.displayNumber}',
                     style: const TextStyle(
                       fontWeight: FontWeight.w600,
                     ),
@@ -1097,14 +1321,13 @@ class _BluetoothPageState extends State<BluetoothPage> {
           if (!_stationReady) ...[
             const SizedBox(height: 12),
             FilledButton.icon(
-              onPressed: _stationInitializing
-                  ? null
-                  : _initializeStation,
+              onPressed:
+              _stationInitializing ? null : _initializeStation,
               icon: const Icon(Icons.settings),
               label: Text(
                 _stationInitializing
                     ? 'Bitte warten …'
-                    : 'Prüfstation einrichten',
+                    : 'Prüfstation einrichten / erneut versuchen',
               ),
             ),
           ],
@@ -1195,18 +1418,27 @@ class _BluetoothPageState extends State<BluetoothPage> {
             Card(
               child: Padding(
                 padding: const EdgeInsets.all(16),
-                child: _valueRow(
-                  'Steuerungsseriennummer',
-                  _serialNumber?.toString() ??
-                      'Noch nicht gelesen',
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text('Steuerungsseriennummer'),
+                    const SizedBox(height: 8),
+                    Text(
+                      _serialNumber?.toString() ??
+                          'Noch nicht gelesen',
+                      style: const TextStyle(
+                        fontSize: 24,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ],
                 ),
               ),
             ),
             const SizedBox(height: 12),
             OutlinedButton.icon(
-              onPressed: _ready && !_busy
-                  ? _readDeviceDataAgain
-                  : null,
+              onPressed:
+              _ready && !_busy ? _readDeviceDataAgain : null,
               icon: const Icon(Icons.refresh),
               label: const Text('Seriennummer erneut lesen'),
             ),
@@ -1226,9 +1458,8 @@ class _BluetoothPageState extends State<BluetoothPage> {
           const SizedBox(height: 20),
 
           const Text(
-            'Prüfstation und Nummernzähler werden lokal '
-                'gespeichert. Die aktuelle Zuordnung und '
-                'Prüfergebnisse sind bisher nur im Arbeitsspeicher. '
+            'Die Prüfhistorie wird lokal als CSV gespeichert. '
+                'Cloud-Synchronisierung ist noch nicht eingerichtet. '
                 'Beim Verlassen dieser Seite wird die '
                 'Bluetooth-Verbindung getrennt.',
             style: TextStyle(

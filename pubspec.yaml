@@ -39,6 +39,8 @@ dependencies:
   permission_handler: 11.3.1
   device_info_plus: ^12.4.0
   shared_preferences: 2.3.2
+  path_provider: 2.1.5
+  share_plus: 10.1.4
 
 dev_dependencies:
   flutter_test:

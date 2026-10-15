@@ -5,6 +5,8 @@ import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/test_session.dart';
+import '../services/test_history.dart';
+import 'test_history_page.dart';
 
 class ParameterDefinition {
   final int register;
@@ -21,15 +23,21 @@ class ParameterDefinition {
 class ParameterCheckPage extends StatefulWidget {
   final String casingNumber;
   final TestSession testSession;
+  final TestHistory history;
 
-  // BluetoothPage continues to own the Bluetooth connection.
   final Future<Map<int, int>> Function() readValues;
+
+  final Future<void> Function(
+      Map<int, int> approvedValues,
+      ) runFunctionalTest;
 
   const ParameterCheckPage({
     super.key,
     required this.casingNumber,
     required this.testSession,
+    required this.history,
     required this.readValues,
+    required this.runFunctionalTest,
   });
 
   @override
@@ -71,6 +79,7 @@ class _ParameterCheckPageState extends State<ParameterCheckPage> {
 
   final _formKey = GlobalKey<FormState>();
   final _preferences = SharedPreferencesAsync();
+  final _operatorController = TextEditingController();
 
   late final Map<int, TextEditingController> _controllers;
 
@@ -84,12 +93,13 @@ class _ParameterCheckPageState extends State<ParameterCheckPage> {
   bool _hasSavedTargets = false;
 
   String _message = 'Sollwerte werden geladen …';
-
   DateTime? _checkedAt;
 
   @override
   void initState() {
     super.initState();
+
+    _operatorController.text = widget.history.operatorName;
 
     _controllers = {
       for (final parameter in definitions)
@@ -132,7 +142,7 @@ class _ParameterCheckPageState extends State<ParameterCheckPage> {
               value < 0 ||
               value > 2147483647) {
             throw FormatException(
-              'Ungültiger Sollwert für '
+              'Ungültiger Sollwert für Register '
                   '${parameter.register}.',
             );
           }
@@ -240,13 +250,33 @@ class _ParameterCheckPageState extends State<ParameterCheckPage> {
     if (_busy || !_loaded || !_editing) return;
     if (!_formKey.currentState!.validate()) return;
 
+    final operatorName = _operatorController.text.trim();
+
+    if (operatorName.isEmpty) {
+      setState(() {
+        _message =
+        'Bitte zuerst Prüfername oder Personalnummer eingeben.';
+      });
+      return;
+    }
+
     FocusScope.of(context).unfocus();
 
     final targets = _currentTargets();
+    widget.history.operatorName = operatorName;
 
     setState(() => _busy = true);
 
     try {
+      await widget.history.record(
+        stage: 'Sollwerte',
+        event: 'Speicherung angefordert',
+        details: jsonEncode({
+          for (final entry in targets.entries)
+            entry.key.toString(): entry.value,
+        }),
+      );
+
       await _preferences.setString(
         storageKey,
         jsonEncode({
@@ -261,9 +291,18 @@ class _ParameterCheckPageState extends State<ParameterCheckPage> {
         _savedTargets = Map<int, int>.from(targets);
         _hasSavedTargets = true;
         _editing = false;
-
         _clearComparison();
+      });
 
+      await widget.history.record(
+        stage: 'Sollwerte',
+        event: 'Sollwerte lokal gespeichert',
+        result: 'OK',
+      );
+
+      if (!mounted) return;
+
+      setState(() {
         _message =
         'Sollwerte gespeichert und gesperrt. '
             'Parameter erneut prüfen.';
@@ -272,7 +311,9 @@ class _ParameterCheckPageState extends State<ParameterCheckPage> {
       if (!mounted) return;
 
       setState(() {
-        _message = 'Speichern fehlgeschlagen: $error';
+        _message =
+        'Speicherung oder Protokollierung fehlgeschlagen: '
+            '$error';
       });
     } finally {
       if (mounted) {
@@ -289,14 +330,27 @@ class _ParameterCheckPageState extends State<ParameterCheckPage> {
       return;
     }
 
+    final operatorName = _operatorController.text.trim();
+
+    if (operatorName.isEmpty) {
+      setState(() {
+        _message =
+        'Bitte Prüfername oder Personalnummer eingeben.';
+      });
+      return;
+    }
+
     FocusScope.of(context).unfocus();
 
     final targets = <int, int>{
       ..._savedTargets,
 
-      // A successful parameter check requires no current error.
+      // Parameter check requires no controller error.
       12002: 0,
     };
+
+    final history = widget.history;
+    history.operatorName = operatorName;
 
     setState(() {
       _busy = true;
@@ -305,6 +359,23 @@ class _ParameterCheckPageState extends State<ParameterCheckPage> {
     });
 
     try {
+      // Storage must work before testing continues.
+      await history.record(
+        stage: 'Parameterprüfung',
+        event: 'Prüfung gestartet',
+        result: 'IN_PROGRESS',
+        details: 'Prüfer: $operatorName',
+      );
+
+      for (final entry in targets.entries) {
+        await history.record(
+          stage: 'Parameterprüfung',
+          event: 'Verwendeter Sollwert',
+          register: entry.key,
+          expected: entry.value,
+        );
+      }
+
       final actual = await widget.readValues();
 
       if (!mounted) return;
@@ -337,9 +408,42 @@ class _ParameterCheckPageState extends State<ParameterCheckPage> {
         );
       }
 
+      for (final entry in actual.entries) {
+        final expected = targets[entry.key];
+
+        await history.record(
+          stage: 'Parameterprüfung',
+          event: 'Register gelesen',
+          register: entry.key,
+          expected: expected,
+          actual: entry.value,
+          result: expected == null
+              ? 'INFO'
+              : expected == entry.value
+              ? 'OK'
+              : 'FAIL',
+        );
+      }
+
       final matches = targets.entries.every(
             (entry) => actual[entry.key] == entry.value,
       );
+
+      await history.record(
+        stage: 'Parameterprüfung',
+        event: 'Parametervergleich abgeschlossen',
+        result: matches
+            ? 'PARAMETER_PASS'
+            : 'PARAMETER_FAIL',
+        details: matches
+            ? 'Alle geforderten Parameter stimmen überein. '
+            'Noch kein Gesamtergebnis der Endprüfung.'
+            : 'Mindestens ein Parameter weicht ab.',
+      );
+
+      await history.ensureSaved();
+
+      if (!mounted) return;
 
       setState(() {
         _actual = Map<int, int>.from(actual);
@@ -347,20 +451,91 @@ class _ParameterCheckPageState extends State<ParameterCheckPage> {
         _checkedAt = DateTime.now();
 
         _message = matches
-            ? 'Parameterprüfung bestanden.'
-            : 'Parameterprüfung nicht bestanden: '
-            'Abweichungen vorhanden.';
+            ? 'Parameterprüfung bestanden. '
+            'Weiter zur Funktionsprüfung möglich.'
+            : 'Parameterprüfung nicht bestanden. '
+            'Funktionsprüfung gesperrt.';
       });
     } catch (error) {
+      var saveFailed = false;
+
+      try {
+        await history.record(
+          stage: 'Parameterprüfung',
+          event: 'Prüfung nicht erfolgreich abgeschlossen',
+          result: 'ERROR',
+          details: error.toString(),
+        );
+      } catch (_) {
+        saveFailed = true;
+      }
+
       if (!mounted) return;
 
       setState(() {
         _clearComparison();
-        _message = 'Keine gültige Parameterprüfung: $error';
+
+        _message = saveFailed
+            ? 'Speicherfehler. Keine gültige Freigabe. '
+            'Bitte Speicherung erneut versuchen.'
+            : 'Keine gültige Parameterprüfung: $error';
       });
     } finally {
       if (mounted) {
         setState(() => _busy = false);
+      }
+    }
+  }
+
+  Future<void> _continueToFunctionalTest() async {
+    final targets = _checkedTargets;
+
+    if (_busy ||
+        _editing ||
+        _passed != true ||
+        targets == null) {
+      return;
+    }
+
+    final operatorName = _operatorController.text.trim();
+
+    if (operatorName.isEmpty) {
+      setState(() {
+        _message = 'Bitte Prüfername eingeben.';
+      });
+      return;
+    }
+
+    FocusScope.of(context).unfocus();
+
+    widget.history.operatorName = operatorName;
+
+    String returnMessage =
+        'Für eine weitere Prüfung die Parameter erneut lesen.';
+
+    setState(() => _busy = true);
+
+    try {
+      await widget.history.record(
+        stage: 'Übergang',
+        event: 'Funktionsprüfung geöffnet',
+        result: 'PARAMETER_GATE_PASSED',
+      );
+
+      await widget.runFunctionalTest(
+        Map<int, int>.from(targets),
+      );
+    } catch (error) {
+      returnMessage =
+      'Funktionsprüfung nicht gestartet oder unterbrochen: '
+          '$error';
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _clearComparison();
+          _message = returnMessage;
+        });
       }
     }
   }
@@ -391,12 +566,42 @@ class _ParameterCheckPageState extends State<ParameterCheckPage> {
         '${two(local.second)}';
   }
 
+  Future<void> _openHistory() async {
+    if (_busy) return;
+
+    setState(() => _busy = true);
+
+    try {
+      await widget.history.ensureSaved();
+
+      if (!mounted) return;
+
+      await Navigator.of(context).push(
+        MaterialPageRoute(
+          builder: (_) => const TestHistoryPage(),
+        ),
+      );
+    } catch (error) {
+      if (!mounted) return;
+
+      setState(() {
+        _message =
+        'CSV konnte nicht gespeichert werden: $error';
+      });
+    } finally {
+      if (mounted) {
+        setState(() => _busy = false);
+      }
+    }
+  }
+
   Widget _parameterCard(ParameterDefinition parameter) {
     final actual = _actual?[parameter.register];
     final expected = _checkedTargets?[parameter.register];
 
     final checked = actual != null && expected != null;
     final matches = checked && actual == expected;
+
     final resultColor = matches ? Colors.green : Colors.red;
 
     return Card(
@@ -416,7 +621,6 @@ class _ParameterCheckPageState extends State<ParameterCheckPage> {
             const SizedBox(height: 4),
             Text('Register ${parameter.register}'),
             const SizedBox(height: 12),
-
             if (_editing)
               TextFormField(
                 controller: _controllers[parameter.register],
@@ -452,9 +656,7 @@ class _ParameterCheckPageState extends State<ParameterCheckPage> {
                   fontWeight: FontWeight.w600,
                 ),
               ),
-
             const SizedBox(height: 12),
-
             Row(
               children: [
                 Expanded(
@@ -489,6 +691,8 @@ class _ParameterCheckPageState extends State<ParameterCheckPage> {
 
   @override
   void dispose() {
+    _operatorController.dispose();
+
     for (final controller in _controllers.values) {
       controller.dispose();
     }
@@ -500,7 +704,7 @@ class _ParameterCheckPageState extends State<ParameterCheckPage> {
   Widget build(BuildContext context) {
     final passed = _passed;
     final errorCode = _actual?[12002];
-    final stationNumber = widget.testSession.stationNumber;
+    final station = widget.testSession.stationNumber;
 
     return PopScope(
       canPop: !_busy,
@@ -508,6 +712,11 @@ class _ParameterCheckPageState extends State<ParameterCheckPage> {
         appBar: AppBar(
           title: const Text('Sollwerte / Istwerte'),
           actions: [
+            IconButton(
+              tooltip: 'Prüfhistorie',
+              onPressed: _busy ? null : _openHistory,
+              icon: const Icon(Icons.history),
+            ),
             IconButton(
               tooltip: 'Sollwerte bearbeiten',
               onPressed: _loaded && !_busy && !_editing
@@ -549,7 +758,7 @@ class _ParameterCheckPageState extends State<ParameterCheckPage> {
                       const SizedBox(height: 8),
                       Text(
                         'Prüfstation: '
-                            '${stationNumber?.toString().padLeft(2, '0') ?? "—"}',
+                            '${station?.toString().padLeft(2, '0') ?? "—"}',
                       ),
                       const SizedBox(height: 8),
                       Text(
@@ -560,19 +769,27 @@ class _ParameterCheckPageState extends State<ParameterCheckPage> {
                   ),
                 ),
               ),
-
-              const SizedBox(height: 12),
-
-              const Text(
-                'Sollwerte werden nur in dieser App gespeichert. '
-                    'Die Steuerung wird nicht verändert.',
-              ),
-
               const SizedBox(height: 16),
-
+              TextField(
+                controller: _operatorController,
+                enabled: !_busy,
+                decoration: const InputDecoration(
+                  labelText: 'Prüfername / Personalnummer',
+                  hintText: 'Zum Beispiel: Rahul / MA-123',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 16),
+              const Text(
+                'Sollwerte sind gesperrt. '
+                    'Änderungen können über das Stiftsymbol '
+                    'freigegeben werden. '
+                    'Die Steuerung wird beim Speichern der '
+                    'Sollwerte nicht verändert.',
+              ),
+              const SizedBox(height: 16),
               for (final parameter in definitions)
                 _parameterCard(parameter),
-
               Card(
                 child: Padding(
                   padding: const EdgeInsets.all(16),
@@ -606,18 +823,18 @@ class _ParameterCheckPageState extends State<ParameterCheckPage> {
                       ),
                       const SizedBox(height: 6),
                       const Text(
-                        'Referenzstatus wird angezeigt und '
-                            'später im Funktionsablauf '
-                            'separat bewertet.',
+                        'Der Referenzstatus wird protokolliert. '
+                            'Die Bewegungsbereitschaft wird vor '
+                            'der Funktionsprüfung erneut geprüft. '
+                            'Die abschließende Installationsvorbereitung '
+                            'bleibt zurückgestellt.',
                         style: TextStyle(fontSize: 12),
                       ),
                     ],
                   ),
                 ),
               ),
-
               const SizedBox(height: 16),
-
               if (_editing) ...[
                 FilledButton.icon(
                   onPressed: _busy ? null : _saveTargets,
@@ -630,7 +847,6 @@ class _ParameterCheckPageState extends State<ParameterCheckPage> {
                 ),
                 const SizedBox(height: 12),
               ],
-
               FilledButton.icon(
                 onPressed: _loaded &&
                     !_busy &&
@@ -645,14 +861,31 @@ class _ParameterCheckPageState extends State<ParameterCheckPage> {
                       : 'Parameter prüfen',
                 ),
               ),
-
+              const SizedBox(height: 12),
+              FilledButton.icon(
+                onPressed: !_busy &&
+                    !_editing &&
+                    passed == true
+                    ? _continueToFunctionalTest
+                    : null,
+                icon: const Icon(Icons.play_arrow),
+                label: const Text(
+                  'Weiter zur Funktionsprüfung',
+                ),
+              ),
+              const SizedBox(height: 12),
+              OutlinedButton.icon(
+                onPressed: _busy ? null : _openHistory,
+                icon: const Icon(Icons.history),
+                label: const Text(
+                  'Prüfhistorie / CSV exportieren',
+                ),
+              ),
               if (_busy) ...[
                 const SizedBox(height: 16),
                 const LinearProgressIndicator(),
               ],
-
               const SizedBox(height: 16),
-
               Text(
                 _message,
                 style: TextStyle(
@@ -664,7 +897,6 @@ class _ParameterCheckPageState extends State<ParameterCheckPage> {
                   fontWeight: FontWeight.bold,
                 ),
               ),
-
               if (_checkedAt != null) ...[
                 const SizedBox(height: 8),
                 Text(
@@ -672,7 +904,6 @@ class _ParameterCheckPageState extends State<ParameterCheckPage> {
                       '${_formatDate(_checkedAt!)}',
                 ),
               ],
-
               if (!_loaded && !_busy)
                 TextButton(
                   onPressed: _loadTargets,
@@ -680,9 +911,7 @@ class _ParameterCheckPageState extends State<ParameterCheckPage> {
                     'Sollwerte erneut laden',
                   ),
                 ),
-
               const SizedBox(height: 16),
-
               const Text(
                 'Diese Bewertung betrifft nur die '
                     'Parameterprüfung. Sie ist noch kein '

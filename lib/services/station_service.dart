@@ -18,12 +18,9 @@ class StationService {
 
   static final _preferences = SharedPreferencesAsync();
 
-  // Serialize setup and number allocation within this app.
   static Future<void> _tail = Future<void>.value();
 
-  static Future<T> _locked<T>(
-      Future<T> Function() action,
-      ) {
+  static Future<T> _locked<T>(Future<T> Function() action) {
     final result = Completer<T>();
 
     _tail = _tail.then((_) async {
@@ -83,7 +80,6 @@ class StationService {
 
   static Future<int?> getStationNumber() async {
     final state = await _readState();
-
     return state?['station_number'] as int?;
   }
 
@@ -105,7 +101,6 @@ class StationService {
           );
         }
 
-        // Keep the existing counters.
         return;
       }
 
@@ -149,7 +144,6 @@ class StationService {
 
       counters[yearKey] = next;
 
-      // Save the increment before handing out the number.
       await _preferences.setString(
         _storageKey,
         jsonEncode({
