@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
+import 'screens/bluetooth_page.dart';
+
 
 void main() {
   runApp(const PruefstandApp());
@@ -387,34 +389,34 @@ class TestSessionPage extends StatelessWidget {
                     borderRadius: BorderRadius.circular(12),
                     border: Border.all(color: AppColors.border),
                   ),
-                  child: const ListTile(
-                    contentPadding: EdgeInsets.all(16),
-                    leading: Icon(
+                  child: ListTile(
+                    contentPadding: const EdgeInsets.all(16),
+                    leading: const Icon(
                       Icons.bluetooth,
                       color: AppColors.orange,
                       size: 30,
                     ),
-                    title: Text(
+                    title: const Text(
                       'Steuerung verbinden',
                       style: TextStyle(fontWeight: FontWeight.w600),
                     ),
-                    subtitle: Text(
-                      'Die Bluetooth-Verbindung wird '
-                          'im nächsten Schritt ergänzt.',
+                    subtitle: const Text(
+                      'Bluetooth-Geräte suchen und Steuerung auswählen.',
                     ),
+                    trailing: const Icon(Icons.chevron_right),
+                    onTap: () {
+                      Navigator.of(context).push(
+                        MaterialPageRoute(
+                          builder: (_) => BluetoothPage(
+                            casingNumber: casingNumber,
+                          ),
+                        ),
+                      );
+                    },
                   ),
                 ),
                 const SizedBox(height: 24),
-                const Text(
-                  'Entwicklungsversion: Diese Sitzung ist nur '
-                      'im Arbeitsspeicher vorhanden. '
-                      'Die dauerhafte Speicherung wird später ergänzt.',
-                  style: TextStyle(
-                    color: AppColors.gray,
-                    fontSize: 13,
-                    height: 1.5,
-                  ),
-                ),
+
               ],
             ),
           ),
