@@ -921,6 +921,8 @@ class _BluetoothPageState extends State<BluetoothPage> {
         102,
         104,
         105,
+        106,   // Production year/month: raw value
+        114,
         12002,
         12010,
       ]) {
@@ -944,6 +946,30 @@ class _BluetoothPageState extends State<BluetoothPage> {
               'mit der Zuordnung überein.',
         );
       }
+
+      final history = _history;
+
+      if (history == null) {
+        throw StateError('Keine Prüfhistorie vorhanden.');
+      }
+
+      await history.record(
+        stage: 'Identifikation',
+        event: 'Produktionsdatum gelesen',
+        register: 106,
+        actual: values[106],
+        result: 'INFO',
+        details: 'Produktionsjahr/-monat als unveränderter Registerwert.',
+      );
+
+      await history.record(
+        stage: 'Identifikation',
+        event: 'Geraetespannung gelesen',
+        register: 114,
+        actual: values[114],
+        result: 'INFO',
+        details: 'Gerätespannung als unveränderter Registerwert.',
+      );
 
       return values;
     } finally {

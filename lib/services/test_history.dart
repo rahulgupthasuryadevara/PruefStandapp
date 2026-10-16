@@ -29,6 +29,8 @@ class TestHistory {
       'Pruefstation': session.stationNumber,
       'Gehaeusenummer': session.casingNumber,
       'Steuerungsseriennummer': session.controllerSerial,
+      'Produktionsdatum': '',
+      'Geraetespannung': '',
       'Pruefer': '',
       'Pruefung_angelegt_UTC':
       session.createdAt.toUtc().toIso8601String(),
@@ -204,12 +206,22 @@ class TestHistory {
     final result = entry['result']?.toString() ?? '';
     final details = entry['details']?.toString() ?? '';
 
+
     final register = int.tryParse(
       entry['register']?.toString() ?? '',
     );
 
     final expected = entry['expected'];
     final actual = entry['actual'];
+    if (stage == 'Identifikation') {
+      if (register == 106 && actual != null) {
+        _summary['Produktionsdatum'] = actual;
+      }
+
+      if (register == 114 && actual != null) {
+        _summary['Geraetespannung'] = actual;
+      }
+    }
 
     if ((stage == 'Parameter' || stage == 'Vorprüfung') &&
         register != null) {
