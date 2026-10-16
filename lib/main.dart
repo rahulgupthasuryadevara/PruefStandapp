@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'screens/bluetooth_page.dart';
 import 'screens/test_history_page.dart';
+import 'screens/cloud_settings_page.dart';
 
 
 void main() {
@@ -202,12 +203,12 @@ class _NewTestPageState extends State<NewTestPage> {
         title: const Text('Ketterer Prüfstand'),
         actions: [
           IconButton(
-            tooltip: 'Prüfhistorie / CSV exportieren',
-            icon: const Icon(Icons.history),
+            tooltip: 'Nextcloud',
+            icon: const Icon(Icons.cloud_outlined),
             onPressed: () {
               Navigator.of(context).push(
-                MaterialPageRoute(
-                  builder: (_) => const TestHistoryPage(),
+                MaterialPageRoute<void>(
+                  builder: (_) => const CloudSettingsPage(),
                 ),
               );
             },

@@ -6,6 +6,7 @@ import '../models/test_session.dart';
 import '../services/functional_test_runner.dart';
 import '../services/test_history.dart';
 import 'test_history_page.dart';
+import '../services/nextcloud_service.dart';
 
 class FunctionalTestPage extends StatefulWidget {
   final TestSession session;
@@ -129,6 +130,9 @@ class _FunctionalTestPageState extends State<FunctionalTestPage>
 
     try {
       final result = await _runner.run();
+      if (result.csvSaved) {
+        unawaited(NextcloudService.syncAfterTest());
+      }
 
       if (!mounted) return;
 
