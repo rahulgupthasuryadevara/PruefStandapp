@@ -3,6 +3,8 @@ import 'package:mobile_scanner/mobile_scanner.dart';
 import 'screens/bluetooth_page.dart';
 import 'screens/test_history_page.dart';
 import 'screens/cloud_settings_page.dart';
+import 'screens/cloud_settings_page.dart';
+import 'screens/test_history_page.dart';
 
 
 void main() {
@@ -202,6 +204,17 @@ class _NewTestPageState extends State<NewTestPage> {
       appBar: AppBar(
         title: const Text('Ketterer Prüfstand'),
         actions: [
+          IconButton(
+            tooltip: 'CSV exportieren',
+            icon: const Icon(Icons.download),
+            onPressed: () {
+              Navigator.of(context).push(
+                MaterialPageRoute<void>(
+                  builder: (_) => const TestHistoryPage(),
+                ),
+              );
+            },
+          ),
           IconButton(
             tooltip: 'Nextcloud',
             icon: const Icon(Icons.cloud_outlined),
